@@ -135,19 +135,7 @@ void McpServer::AddUserOnlyTools() {
             return board.GetSystemInfoJson();
         });
 
-    AddTool("self.reboot", "Reboot the system",
-        PropertyList(),
-        [this](const PropertyList& properties) -> ReturnValue {
-            auto& app = Application::GetInstance();
-            app.Schedule([&app]() {
-                ESP_LOGW(TAG, "User requested reboot");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-
-                app.Reboot();
-            });
-            return true;
-        });
-
+    // NOTE: self.reboot MCP tool removed — causes issues
     // NOTE: self.upgrade_firmware MCP tool removed — OTA upgrade has been stripped
     // from this build. Reflash manually via `idf.py flash` instead.
 
