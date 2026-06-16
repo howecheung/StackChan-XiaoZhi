@@ -1670,6 +1670,24 @@ private:
         }
     }
 
+    void RegisterExpressionMcpTool() {
+        auto& mcp = McpServer::GetInstance();
+        auto display = GetDisplay();
+        mcp.AddTool("self.face.expression",
+            "Set the facial expression/emotion on screen. "
+            "Available emotions: neutral, happy, sad, angry, thinking, surprised, laughing, crying, sleepy, winking, loving, cool, confident, confused, embarrassed, funny, relaxed, shocked, silly. "
+            "Use this when the user asks to show a specific emotion or the conversation tone calls for one.",
+            PropertyList({
+                Property("emotion", kPropertyTypeString)
+            }),
+            [display](const PropertyList& props) -> ReturnValue {
+                auto emotion = props["emotion"].value<std::string>();
+                display->SetEmotion(emotion.c_str());
+                ESP_LOGI(TAG, "MCP face expression: %s", emotion.c_str());
+                return true;
+            });
+    }
+
     void RegisterLedMcpTools() {
         auto& mcp = McpServer::GetInstance();
         mcp.AddTool("self.led.set_color",
@@ -2151,6 +2169,7 @@ public:
             servo_ok_ = servo_.Begin();
             InitializePy32LedDevice();
             RegisterLedMcpTools();
+            RegisterExpressionMcpTool();
         }
 
         InitializeSpi();
