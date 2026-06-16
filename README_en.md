@@ -127,6 +127,8 @@ Open `http://localhost:3000` in browser. Edit `managed_components/78__esp-wifi-c
 <details>
 <summary>Click to expand</summary>
 
+- **2026-06-17** · **v0.0.2** released
+- **2026-06-16** · Config page enhancements: 🤖 robot icon + "StackChan" branding + theme toggle (auto/light/dark) + color-coded signal bars + CN/EN languages only; New `self.face.expression` MCP tool (19 emotions) + `self.get_system_info` promoted to public tool; WiFi connect timeout 60s → 10s + auto-clear bad credentials after 3 failures + clear on long-press; Local preview: `node scripts/wifi-preview.js`
 - **2026-06-16** · esp-wifi-connect v3.1.5 → v3.2.1: CSS design tokens + dark mode + gradient background + scan animation + 45 languages; OTA config and sleep mode visibility enabled
 - **2026-06-15** · Wi-Fi config page (192.168.4.1) redesign: iOS-style segmented control + large rounded cards + signal strength visualization + StackChan branding
 - **2026-06-11** · Fixed sleep mechanism (restored idle check, no more false sleep during conversation, timeout 60s → 30s); Idle long-press screen 5s to enter Wi-Fi config mode; Mute BMI270 motion sensor during speech to prevent servo shake from triggering IMU
