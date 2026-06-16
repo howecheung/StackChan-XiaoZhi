@@ -56,6 +56,8 @@ void WifiBoard::StartNetwork() {
     WifiManagerConfig config;
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
+    config.show_ota_config = true;
+    config.show_sleep_config = true;
     wifi_manager.Initialize(config);
 
     // Set unified event callback - forward to NetworkEvent with SSID data
