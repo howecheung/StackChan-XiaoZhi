@@ -9,9 +9,9 @@ enum DeviceState {
     kDeviceStateConnecting,
     kDeviceStateListening,
     kDeviceStateSpeaking,
-    kDeviceStateUpgrading,
-    kDeviceStateActivating,
     kDeviceStateAudioTesting,
+    kDeviceStateActivating,
+    kDeviceStateUpgrading,
     kDeviceStateFatalError
 };
 

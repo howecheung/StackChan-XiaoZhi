@@ -224,16 +224,22 @@ esp_err_t Ota::CheckVersion() {
 
         if (cJSON_IsString(version) && cJSON_IsString(url)) {
             // Check if the version is newer, for example, 0.1.0 is newer than 0.0.1
-            has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
-            if (has_new_version_) {
-                ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
+            bool is_newer = IsNewVersionAvailable(current_version_, firmware_version_);
+            if (is_newer) {
+                ESP_LOGI(TAG, "New version available: %s (suppressed: manual flashing only)", firmware_version_.c_str());
             } else {
                 ESP_LOGI(TAG, "Current is the latest version");
             }
+            // User request: do NOT auto-install. Force has_new_version_ = false
+            // regardless of what the server says, so the application never
+            // calls UpgradeFirmware. To update firmware, reflash via idf.py.
+            has_new_version_ = false;
+            (void)is_newer;  // version comparison kept for logging only
             // If the force flag is set to 1, the given version is forced to be installed
             cJSON *force = cJSON_GetObjectItem(firmware, "force");
             if (cJSON_IsNumber(force) && force->valueint == 1) {
-                has_new_version_ = true;
+                ESP_LOGW(TAG, "Server requested forced upgrade to %s — IGNORED (manual flashing only)",
+                         firmware_version_.c_str());
             }
         }
     } else {

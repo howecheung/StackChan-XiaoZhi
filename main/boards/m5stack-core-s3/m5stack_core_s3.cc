@@ -18,9 +18,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <sys/time.h>
-#include "esp_sntp.h"
 #include "esp_video.h"
 #include "lvgl.h"
 #include "SCSCL.h"
@@ -1336,9 +1333,6 @@ private:
     bmi270_handle_t bmi_handle_ = nullptr;
     TaskHandle_t motion_task_ = nullptr;
     int64_t last_motion_trigger_us_ = 0;
-    // ---- 早安 cron ----
-    TaskHandle_t morning_task_ = nullptr;
-    int last_greeting_day_ = -1;  // 上次触发的日期（tm_yday），跨日 reset
     // ---- SI12T 3 区触摸 ----
     i2c_master_bus_handle_t si12t_bus_ = nullptr;
     i2c_master_dev_handle_t si12t_dev_ = nullptr;
@@ -1460,6 +1454,10 @@ private:
             }
 
             still_count = 0;
+
+            // 设备说话时忽略体感（舵机晃动会触发 IMU 误检测）
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) continue;
+
             if (!armed) continue;  // 已触发过，等静止 re-arm
             // 全局冷却：上次触发后 5 分钟内任何情况都不再触发
             if (last_motion_trigger_us_ != 0 && (now - last_motion_trigger_us_) < GLOBAL_COOLDOWN_US) continue;
@@ -1479,7 +1477,11 @@ private:
                 lift_count = 0;
                 last_motion_trigger_us_ = now;
                 for (int i = 0; i < 8; i++) shake_peak_times[i] = 0;
-                SendUserMessage(PickRandom(ShakePool()));
+                const auto& m = PickRandom(ShakePool());
+                if (m.display) {
+                    if (auto* disp = GetDisplay()) disp->SetChatMessage("user", m.display);
+                    SendUserMessage(m.tag);
+                }
                 continue;
             }
 
@@ -1489,61 +1491,16 @@ private:
                 armed = false;
                 lift_count = 0;
                 last_motion_trigger_us_ = now;
-                SendUserMessage(PickRandom(LiftPool()));
+                const auto& m = PickRandom(LiftPool());
+                if (m.display) {
+                    if (auto* disp = GetDisplay()) disp->SetChatMessage("user", m.display);
+                    SendUserMessage(m.tag);
+                }
             }
         }
     }
 
-    void InitializeMorningGreeting() {
-        // 设置北京时间时区——SNTP 启动延后到 task 内（等 WiFi/lwip 起来）
-        setenv("TZ", "CST-8", 1);
-        tzset();
-        xTaskCreatePinnedToCore(MorningTaskFunc, "morning", 3072, this, 1, &morning_task_, 1);
-    }
-
-    static void MorningTaskFunc(void* arg) {
-        static_cast<M5StackCoreS3Board*>(arg)->MorningLoop();
-        vTaskDelete(nullptr);
-    }
-
-    void MorningLoop() {
-        // 工作日早 7:50（容差 7:50-7:55）触发一次"早安+天气"
-
-        // 等 WiFi/lwip 起来再启动 SNTP（构造函数早期 init SNTP 会导致 tcpip mbox assert）
-        vTaskDelay(pdMS_TO_TICKS(20000));
-        if (!esp_sntp_enabled()) {
-            esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-            esp_sntp_setservername(0, "ntp.aliyun.com");
-            esp_sntp_setservername(1, "ntp.tencent.com");
-            esp_sntp_init();
-            ESP_LOGI(TAG, "SNTP started (delayed)");
-        }
-
-        while (true) {
-            vTaskDelay(pdMS_TO_TICKS(60000));  // 每分钟检查一次
-
-            time_t now;
-            struct tm tm_now;
-            time(&now);
-            localtime_r(&now, &tm_now);
-
-            // NTP 还没同步成功（默认年是 1970）— 跳过
-            if (tm_now.tm_year + 1900 < 2025) continue;
-
-            int wday = tm_now.tm_wday;  // 0=周日, 1=周一, ..., 6=周六
-            if (wday < 1 || wday > 5) continue;  // 只在工作日
-
-            if (tm_now.tm_hour != 7) continue;
-            if (tm_now.tm_min < 50 || tm_now.tm_min > 55) continue;
-
-            if (last_greeting_day_ == tm_now.tm_yday) continue;  // 今天已触发过
-            last_greeting_day_ = tm_now.tm_yday;
-
-            ESP_LOGI(TAG, "Morning greeting trigger at %02d:%02d wday=%d",
-                     tm_now.tm_hour, tm_now.tm_min, wday);
-            SendUserMessage("（早安场景：工作日早上到了，用温暖的语气问候主人，用 get_weather 查今天天气提醒穿什么，祝主人今天顺利。）");
-        }
-    }
+    // (Morning greeting + weather timer task removed; see git history.)
 
     // ---- PY32 IO Expander 控 WS2812 RGB LED ×12 ----
     // 协议（来自 M5Stack/StackChan-BSP）:
@@ -1687,24 +1644,51 @@ private:
                 uint8_t cur = (out >> (zone * 2)) & 0x03;
                 uint8_t prev = (si12t_last_state_ >> (zone * 2)) & 0x03;
                 if (cur != 0 && prev == 0 && (now - last_touch_time > TOUCH_COOLDOWN_US)) {
-                    static const char* msgs[] = {
-                        "（主人摸了摸小智的头）",
-                        "（主人揉了揉小智的头顶）",
-                        "（主人轻轻拍了拍小智的脑袋）",
-                        "（主人用额头抵着小智的额头蹭了蹭）",
-                        "（主人用手指戳了戳小智的脑门）",
-                        "（主人温柔地抚摸小智的头发）",
-                        "（主人理了理小智的头发）",
+                    // display = 屏幕展示的完整动作描写（带括号，作为场景旁白）
+                    // tag    = 发给 LLM 的短动作标签（≤6 字），避开 detect.text 长度限制
+                    struct TouchMsg { const char* display; const char* tag; };
+                    static const TouchMsg msgs[] = {
+                        {"（主人摸了摸小智的头）",         "主人摸了摸头"},
+                        {"（主人揉了揉小智的头顶）",       "主人揉了揉头"},
+                        {"（主人轻轻拍了拍小智的脑袋）",   "主人拍了拍头"},
+                        {"（主人用额头抵着小智的额头蹭了蹭）", "主人蹭了蹭额头"},
+                        {"（主人用手指戳了戳小智的脑门）", "主人戳了戳脑门"},
+                        {"（主人温柔地抚摸小智的头发）",   "主人抚摸头发"},
+                        {"（主人理了理小智的头发）",       "主人理了理头发"},
                     };
-                    const char* msg = msgs[esp_random() % 7];
-                    ESP_LOGI(TAG, "SI12T touch -> %s", msg);
-                    SendUserMessage(msg);
+                    const auto& m = msgs[esp_random() % 7];
+                    ESP_LOGI(TAG, "SI12T touch -> %s | tag=%s", m.display, m.tag);
+                    if (auto* disp = GetDisplay()) {
+                        disp->SetChatMessage("user", m.display);
+                    }
+                    SendUserMessage(m.tag);
                     last_touch_time = now;
                     break;
                 }
             }
             si12t_last_state_ = out;
         }
+    }
+
+    void RegisterExpressionMcpTool() {
+        auto& mcp = McpServer::GetInstance();
+        mcp.AddTool("self.face.expression",
+            "Set the facial expression/emotion on screen (line-art animated emote style). "
+            "Common emotions: neutral, happy, sad, angry, surprised, thinking, sleepy, blink, dizzy, loading, speaking, listening, idle. "
+            "Use this when the user asks to show a specific emotion or the conversation tone calls for one. "
+            "If the emotion name is not found in the asset pack, it will be ignored safely.",
+            PropertyList({
+                Property("emotion", kPropertyTypeString)
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto emotion = props["emotion"].value<std::string>();
+                auto display = GetDisplay();
+                if (display) {
+                    display->SetEmotion(emotion.c_str());
+                }
+                ESP_LOGI(TAG, "MCP face expression: %s", emotion.c_str());
+                return true;
+            });
     }
 
     void RegisterLedMcpTools() {
@@ -1749,7 +1733,7 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
+        power_save_timer_ = new PowerSaveTimer(-1, 30, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(0);
@@ -1904,31 +1888,49 @@ private:
     }
 
     // ---- IMU 触发的池子 ----
-    static const std::vector<const char*>& LiftPool() {
-        static const std::vector<const char*> pool = {
-            "（主人咬牙把小智抱了起来）",
-            "（主人踮起脚搂住小智）",
-            "（主人抱着小智转了一圈）",
-            "（主人趁小智熟睡偷偷凑到面前）",
-            "（主人举起东西向小智展示）",
-            "（主人把小智揣进衣兜带走）",
+    // Same display+tag split as the SI12T touch handler: full descriptive
+    // text shown on screen, short action verb sent to LLM (must be ≤24 bytes
+    // UTF-8 to pass the detect.text length check in Application::SendUserText).
+    struct MotionMsg { const char* display; const char* tag; };
+
+    static const std::vector<MotionMsg>& LiftPool() {
+        static const std::vector<MotionMsg> pool = {
+            {"（主人咬牙把小智抱了起来）", "主人抱起了小智"},
+            {"（主人踮起脚搂住小智）",   "主人搂住小智"},
+            {"（主人抱着小智转了一圈）",   "抱着转圈"},
+            {"（主人趁小智熟睡偷偷凑到面前）", "偷偷凑过来"},
+            {"（主人举起东西向小智展示）", "向小智展示"},
+            {"（主人把小智揣进衣兜带走）", "揣进衣兜"},
         };
         return pool;
     }
 
-    static const std::vector<const char*>& ShakePool() {
-        static const std::vector<const char*> pool = {
-            "（主人拉起小智的手晃来晃去）",
-            "（主人摇了摇小智）",
-            "（主人从背后偷偷吓小智）",
-            "（主人趴在小智背上晃来晃去）",
-            "（主人勾着小智的脖子摇来摇去）",
-            "（主人拉着小智学小鸭子走路）",
-            "（主人托着小智的脸颊轻轻摇晃）",
+    static const std::vector<MotionMsg>& ShakePool() {
+        static const std::vector<MotionMsg> pool = {
+            {"（主人拉起小智的手晃来晃去）", "晃来晃去"},
+            {"（主人摇了摇小智）",         "摇了摇"},
+            {"（主人从背后偷偷吓小智）",   "偷偷吓我"},
+            {"（主人趴在小智背上晃来晃去）", "趴在背上"},
+            {"（主人勾着小智的脖子摇来摇去）", "勾着脖子"},
+            {"（主人拉着小智学小鸭子走路）", "学鸭子走"},
+            {"（主人托着小智的脸颊轻轻摇晃）", "托脸摇晃"},
         };
         return pool;
     }
 
+    static const MotionMsg& PickRandom(const std::vector<MotionMsg>& pool) {
+        static const MotionMsg kEmpty{nullptr, nullptr};
+        if (pool.empty()) return kEmpty;
+        return pool[esp_random() % pool.size()];
+    }
+
+    // Legacy overload for the gesture pools (UpSwipePool / DownSwipePool /
+    // LeftSwipePool / RightSwipePool / DoubleClickPool). These still hold the
+    // raw long Chinese descriptions; the long text is dropped by the
+    // 24-byte length check in Application::SendUserText (no crash, just a
+    // silent drop + WARN log). Kept so the gesture UI events compile and run;
+    // they currently don't reach the LLM. To enable LLM reaction, convert
+    // each pool to a vector<MotionMsg> with display+tag pairs.
     static const char* PickRandom(const std::vector<const char*>& pool) {
         if (pool.empty()) return nullptr;
         return pool[esp_random() % pool.size()];
@@ -1988,6 +1990,15 @@ private:
             touch_total_move += abs(touch_point.x - touch_last_x) + abs(touch_point.y - touch_last_y);
             touch_last_x = touch_point.x;
             touch_last_y = touch_point.y;
+
+            // 空闲状态下长按 5 秒 → 进入配网模式
+            if (!pet_triggered && Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                if (now - touch_start_time >= 5000) {
+                    pet_triggered = true;
+                    EnterWifiConfigMode();
+                    return;
+                }
+            }
 
             // 长按摸头（要手指有移动，不算被物体压）
             if (!pet_triggered) {
@@ -2161,6 +2172,7 @@ public:
             servo_ok_ = servo_.Begin();
             InitializePy32LedDevice();
             RegisterLedMcpTools();
+            RegisterExpressionMcpTool();
         }
 
         InitializeSpi();
@@ -2181,7 +2193,7 @@ public:
         InitializeFt6336TouchPad();
         InitializeBmi270();
         InitializeSi12T();
-        InitializeMorningGreeting();
+        // Morning greeting + weather timer task removed; no-op call removed too
 
         esp_timer_create_args_t status_args = {};
         status_args.callback = [](void* arg) {

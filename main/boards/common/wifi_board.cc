@@ -24,7 +24,13 @@
 static const char *TAG = "WifiBoard";
 
 // Connection timeout in seconds
-static constexpr int CONNECT_TIMEOUT_SEC = 60;
+static constexpr int CONNECT_TIMEOUT_SEC = 10;
+static constexpr int MAX_CONSECUTIVE_FAILURES = 3;
+static const char* NVS_WIFI_NS = "wifi";
+static const char* NVS_FAIL_CNT = "conn_fail_cnt";
+
+static void ResetFailureCount();
+static void IncrementFailureCount();
 
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
@@ -56,6 +62,8 @@ void WifiBoard::StartNetwork() {
     WifiManagerConfig config;
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
+    config.show_ota_config = true;
+    config.show_sleep_config = true;
     wifi_manager.Initialize(config);
 
     // Set unified event callback - forward to NetworkEvent with SSID data
@@ -108,6 +116,7 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::Connected:
             // Stop timeout timer
             esp_timer_stop(connect_timer_);
+            ResetFailureCount();
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
             // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
@@ -148,11 +157,29 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
     network_event_callback_ = std::move(callback);
 }
 
+static void IncrementFailureCount() {
+    Settings nvs(NVS_WIFI_NS, false);
+    int cnt = nvs.GetInt(NVS_FAIL_CNT, 0) + 1;
+    nvs.SetInt(NVS_FAIL_CNT, cnt);
+    ESP_LOGW(TAG, "WiFi connection failure #%d", cnt);
+    if (cnt >= MAX_CONSECUTIVE_FAILURES) {
+        ESP_LOGW(TAG, "Clearing saved SSIDs after %d consecutive failures", cnt);
+        SsidManager::GetInstance().Clear();
+        nvs.SetInt(NVS_FAIL_CNT, 0);
+    }
+}
+
+static void ResetFailureCount() {
+    Settings nvs(NVS_WIFI_NS, false);
+    nvs.SetInt(NVS_FAIL_CNT, 0);
+}
+
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
     ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
 
     WifiManager::GetInstance().StopStation();
+    IncrementFailureCount();
     board->StartWifiConfigMode();
 }
 
@@ -199,6 +226,10 @@ void WifiBoard::StartWifiConfigMode() {
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+
+    // Clear saved SSIDs so next boot goes straight to config mode
+    SsidManager::GetInstance().Clear();
+    ResetFailureCount();
 
     auto& app = Application::GetInstance();
     auto state = app.GetDeviceState();

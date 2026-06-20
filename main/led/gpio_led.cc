@@ -11,8 +11,6 @@
 
 #define IDLE_BRIGHTNESS 5
 #define SPEAKING_BRIGHTNESS 75
-#define UPGRADING_BRIGHTNESS 25
-#define ACTIVATING_BRIGHTNESS 35
 
 #define BLINK_INFINITE -1
 
@@ -238,14 +236,6 @@ void GpioLed::OnStateChanged() {
         case kDeviceStateSpeaking:
             SetBrightness(SPEAKING_BRIGHTNESS);
             TurnOn();
-            break;
-        case kDeviceStateUpgrading:
-            SetBrightness(UPGRADING_BRIGHTNESS);
-            StartContinuousBlink(100);
-            break;
-        case kDeviceStateActivating:
-            SetBrightness(ACTIVATING_BRIGHTNESS);
-            StartContinuousBlink(500);
             break;
         default:
             ESP_LOGE(TAG, "Unknown gpio led event: %d", device_state);

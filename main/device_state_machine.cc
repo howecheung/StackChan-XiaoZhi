@@ -14,9 +14,9 @@ static const char* const STATE_STRINGS[] = {
     "connecting",
     "listening",
     "speaking",
-    "upgrading",
-    "activating",
     "audio_testing",
+    "activating",
+    "upgrading",
     "fatal_error",
     "invalid_state"
 };
@@ -107,7 +107,7 @@ bool DeviceStateMachine::CanTransitionTo(DeviceState target) const {
 
 bool DeviceStateMachine::TransitionTo(DeviceState new_state) {
     DeviceState old_state = current_state_.load();
-    
+
     // No-op if already in the target state
     if (old_state == new_state) {
         return true;
@@ -154,7 +154,7 @@ void DeviceStateMachine::NotifyStateChange(DeviceState old_state, DeviceState ne
             callbacks_copy.push_back(cb);
         }
     }
-    
+
     for (const auto& cb : callbacks_copy) {
         cb(old_state, new_state);
     }

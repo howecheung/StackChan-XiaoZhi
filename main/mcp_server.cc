@@ -127,7 +127,7 @@ void McpServer::AddCommonTools() {
 
 void McpServer::AddUserOnlyTools() {
     // System tools
-    AddUserOnlyTool("self.get_system_info",
+    AddTool("self.get_system_info",
         "Get the system information",
         PropertyList(),
         [this](const PropertyList& properties) -> ReturnValue {
@@ -135,38 +135,9 @@ void McpServer::AddUserOnlyTools() {
             return board.GetSystemInfoJson();
         });
 
-    AddUserOnlyTool("self.reboot", "Reboot the system",
-        PropertyList(),
-        [this](const PropertyList& properties) -> ReturnValue {
-            auto& app = Application::GetInstance();
-            app.Schedule([&app]() {
-                ESP_LOGW(TAG, "User requested reboot");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-
-                app.Reboot();
-            });
-            return true;
-        });
-
-    // Firmware upgrade
-    AddUserOnlyTool("self.upgrade_firmware", "Upgrade firmware from a specific URL. This will download and install the firmware, then reboot the device.",
-        PropertyList({
-            Property("url", kPropertyTypeString, "The URL of the firmware binary file to download and install")
-        }),
-        [this](const PropertyList& properties) -> ReturnValue {
-            auto url = properties["url"].value<std::string>();
-            ESP_LOGI(TAG, "User requested firmware upgrade from URL: %s", url.c_str());
-            
-            auto& app = Application::GetInstance();
-            app.Schedule([url, &app]() {
-                bool success = app.UpgradeFirmware(url);
-                if (!success) {
-                    ESP_LOGE(TAG, "Firmware upgrade failed");
-                }
-            });
-            
-            return true;
-        });
+    // NOTE: self.reboot MCP tool removed — causes issues
+    // NOTE: self.upgrade_firmware MCP tool removed — OTA upgrade has been stripped
+    // from this build. Reflash manually via `idf.py flash` instead.
 
     // Display control
 #ifdef HAVE_LVGL
