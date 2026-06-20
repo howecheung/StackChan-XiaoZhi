@@ -1,149 +1,155 @@
-﻿# Stackchan-HtSz: M5Stack Core S3 Stack-chan 个性化增强固件
+# 🤖 StackChan-XiaoZhi
 
-基于 [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) 的 M5Stack Core S3 Stack-chan 增强固件。在原版语音交互基础上增加了触摸、体感、情绪灯、舵机等交互能力，侧重**陪伴感**体验。
+> M5Stack Core S3 Stack-chan 陪伴机器人固件 —— 触摸 · 体感 · 情绪灯 · 舵机
 
-> 基于 [mo-hantang/Stackchan-HtSz](https://github.com/mo-hantang/Stackchan-HtSz) 项目修改
+基于 [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)，专注**陪伴感**体验。源自 [mo-hantang/Stackchan-HtSz](https://github.com/mo-hantang/Stackchan-HtSz)。
 
-## 更新日志
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-ESP32--S3-green?logo=espressif" alt="ESP32-S3">
+  <img src="https://img.shields.io/badge/framework-ESP--IDF%20v5.5-blue?logo=espressif" alt="ESP-IDF v5.5">
+  <img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="License">
+  <img src="https://img.shields.io/github/v/release/howecheung/StackChan-XiaoZhi" alt="Release">
+</p>
 
-### 2026-06-06
-- **唤醒词灵敏度重构**：`CONFIG_CUSTOM_WAKE_WORD_THRESHOLD` 改为 `CONFIG_WAKE_WORD_SENSITIVITY` Low/Medium/High 三档，AFE/ESP/自定义三种唤醒方式统一采用
-- **文本打断优化**：`SendUserText` 在 Speaking 状态下打断说话并重新唤醒，Listening 状态下关闭音频通道后重新唤醒
-- **M5Stack Core S3 休眠背光**：进入休眠时背光亮度改为 0，彻底熄灭
-- **省电定时器**：绕过 NVS `sleep_mode` 设置和 `CanEnterSleepMode` 检查，始终启用
-- **SPIRAM 模式**：esp32s3 从 OCT 改回 QUAD
+---
 
-## 功能一览
+## ✨ 功能
 
-### 头顶触摸 (SI12T)
-- 3区电容触摸，摸头触发对话
-- 7条随机触摸回应文本（可自定义）
-- 5秒触发冷却
-- 抗EMI：0xCC灵敏度 + 12秒FTC校准等待（基于 M5Stack BSP 参考实现和 TS12 datasheet）
+| 模块 | 硬件 | 说明 |
+|---|---|---|
+| 🎤 唤醒词 | Multinet6 | "你好小智"，灵敏度 Low / Medium / High |
+| 👆 头顶触摸 | SI12T | 3 区电容触摸，摸头对话，7 条随机回应 |
+| 📱 屏幕触摸 | FT6336 | 双击 / 滑动 / 长按 6 种手势，60 条动作文本 |
+| 🕺 体感检测 | BMI270 | 摇晃 + 抱起互动，说话自动屏蔽，5 分钟冷却 |
+| 💡 情绪灯环 | WS2812×12 | 21 种情绪颜色，PY32 IO Expander 控制 |
+| 🎯 舵机追踪 | SCS 总线 | GC0308 人脸追踪 + 空闲扫视，对话暂停 |
+| 😴 智能休眠 | — | 30 秒空闲关灯 / 停舵机 / 熄屏，唤醒词恢复 |
+| 🔌 重新配网 | — | Idle 长按屏幕 5 秒进入 192.168.4.1 配网（页面已美化，升级至 esp-wifi-connect v3.2.1，支持暗色模式） |
+| ✂️ 文本打断 | — | 对话中插文本消息，不静默丢弃 |
+| 🔧 MCP 工具 | — | LED / 音量 / 亮度 / 摄像头 / 系统信息 |
 
-### 体感检测 (BMI270)
-- **摇晃检测**：摇一摇触发互动
-- **抱起检测**：拿起来触发互动
-- 5分钟全局冷却，armed/disarmed 状态机
-- 自定义 BMI270 驱动（地址 0x69，绕过 SDK 默认 0x68）
+## 📡 全链路部署指南
 
-### 屏幕触摸 (FT6336)
-- 双击、上下左右滑动、长按 6 种手势
-- 60 条随机动作文本（可自定义）
+从硬件固件到云端联网搜索的完整部署链路 → **[README_ALL.md](README_ALL.md)**
 
-### WS2812 情绪灯环
-- 12颗 LED，通过 PY32 IO Expander (0x6F) 控制
-- 21种情绪对应颜色映射，跟表情同步变化
-- MCP 工具支持：`self.led.set_color`、`self.led.turn_off`、`self.led.auto`
+---
 
-### 舵机 (SCS 总线)
-- 摄像头人脸追踪 (GC0308)
-- 空闲扫视动画
-- 对话时暂停/恢复
+## 🚀 快速开始
 
-### 文本打断
-- LLM/用户输入文本消息可在 Speaking/Listening 状态下打断当前对话并重新唤醒
-- 避免对话中发文本被静默丢弃
-
-### 早安问候 (定时任务)
-- 工作日早上定时问候 + 天气查询
-- SNTP 延迟启动（避免 tcpip panic）
-
-### 自定义唤醒词
-- Multinet6 自定义唤醒词支持
-- 通过 `sdkconfig.defaults` 配置
-
-### 其他
-- I2C 错误容错处理（防止偶发超时导致整机重启）
-- 摄像头拍照（MCP 工具）
-- 电池监测 + 低电量提醒
-- 休眠时自动进入省电模式，背光彻底熄灭
-- 省电定时器始终启用，不再受 NVS 设置影响
-
-## 已知问题和注意事项
-
-1. **负载过大时可能无法开机**：电池供电 + 灯全亮时偶尔出现。已改为对话才亮灯，但不排除仍可能发生。解决办法：插 USB 再开机。
-
-2. **LLM 控灯偶尔卡住**：让 LLM 调灯时有概率卡住。可以加看门狗，目前未实现。
-
-3. **LLM 口头说调灯但实际不动**：prompt 里加了强制要求但不保证每次生效。
-
-4. **自定义灯光后需要物理重启**：烧录后需要拔 USB + 关机，等 30 秒后再插 USB 重启。尝试过用软件方式免除但未成功。换色不频繁的话影响不大。
-
-5. **唤醒词灵敏度需自行调整**：默认阈值可能在易误触发和需要大声喊之间摇摆，请在 `sdkconfig.defaults` 里调整 `CONFIG_WAKE_WORD_SENSITIVITY`（Low/Medium/High 三档）找到适合自己环境的值。另外灵敏度和唤醒词本身关系很大——生僻词/自定义人名的识别率天然低于"你好小智"这类常见词组，需要设成 High（更灵敏）才能触发，但相应误触发概率也会增加。
-
-6. **自部署小智服务端的朋友注意安全配置**：
-① 服务端的 websocket 和 http 端口不要直接暴露公网，用防火墙限制访问来源
-② config 里的 auth.enabled 一定要改成 true，加上你设备的 MAC 白名单
-③ TTS、LLM 这些第三方 API Key 不要写在配置文件里暴露着，端口一旦被扫到配置就全泄露了
-④ 小智有摄像头调用能力，端口裸奔等于把摄像头开放给任何人
-⑤ 公网端口扫描是常态，部署完记得 ss -tlnp 检查一下自己开了哪些端口。安全无小事。
-
-## 编译
-
-需要 [ESP-IDF v5.5.x](https://github.com/espressif/esp-idf)。
+从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载 `bootloader.bin`、`partition-table.bin`、`ota_data_initial.bin`、`xiaozhi.bin`，一行命令烧录：
 
 ```bash
-# 克隆
-git clone https://github.com/mo-hantang/Stackchan-HtSz.git
-cd Stackchan-HtSz
-
-# 编译（低配机器用 -j1 避免内存不足）
-idf.py build -- -j1
-```
-
-## 烧录
-
-```bash
-# 全量烧录（首次或 OTA 出问题时使用）
-idf.py flash
-
-# 或手动指定：
-python -m esptool --chip esp32s3 -b 460800 \
+pip install esptool
+esptool.py --chip esp32s3 -p COM4 -b 460800 \
   --before default_reset --after hard_reset \
   write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x0 build/bootloader/bootloader.bin \
-  0x8000 build/partition_table/partition-table.bin \
-  0xd000 build/ota_data_initial.bin \
-  0x410000 build/xiaozhi.bin
+  0x0       bootloader.bin \
+  0x8000    partition-table.bin \
+  0xd000    ota_data_initial.bin \
+  0x410000  xiaozhi.bin
 ```
 
-> **注意**：如果之前用过 OTA 升级，务必同时刷入 `ota_data_initial.bin`（地址 0xd000），否则设备可能从旧分区启动。
+> `COM4` 换成实际串口号。首次烧录建议先 `esptool.py erase_flash` 清空旧配置。
 
-## 配置
+---
 
-编译前修改 `sdkconfig.defaults`：
+## 🔨 源码编译
 
+需要 **ESP-IDF v5.5.x**，在 "ESP-IDF 5.5 CMD" 中执行：
+
+```bat
+git clone https://github.com/howecheung/StackChan-XiaoZhi.git
+cd StackChan-XiaoZhi
+
+:: 首次编译
+idf.py set-target esp32s3
+idf.py fullclean
+idf.py build flash
+
+:: 后续增量编译
+idf.py build flash
 ```
-CONFIG_BOARD_TYPE_M5STACK_CORE_S3=y
-CONFIG_USE_CUSTOM_WAKE_WORD=y
-CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
-CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
-CONFIG_WAKE_WORD_SENSITIVITY_MEDIUM=y
-CONFIG_OTA_URL="http://你的服务器IP:8003/xiaozhi/ota/"
+
+低配机器防 OOM：`idf.py build flash -- -j1`
+
+---
+
+## ⚙️ 配置
+
+编辑 `sdkconfig.defaults`：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `CONFIG_CUSTOM_WAKE_WORD` | `ni hao xiao zhi` | 唤醒词拼音 |
+| `CONFIG_CUSTOM_WAKE_WORD_DISPLAY` | `你好小智` | 中文显示 |
+| `CONFIG_WAKE_WORD_SENSITIVITY` | `MEDIUM` | `LOW` / `MEDIUM` / `HIGH` |
+
+### 🛠 自定义行为池
+
+编辑 `main/boards/m5stack-core-s3/m5stack_core_s3.cc`：
+
+| 搜索关键词 | 对应功能 |
+|---|---|
+| `HeadTouchPool` | 摸头回应文本 |
+| `DoubleClickPool` / `UpSwipePool` … | 手势动作文本 |
+| `ShakePool` / `LiftPool` | 体感动作（MotionMsg 格式） |
+| `UpdateLedsFromEmotion` | 情绪灯颜色映射 |
+
+---
+
+## 📖 功能使用方法
+
+### 🔌 配网页面预览（无需烧录）
+
+修改配网页面后，可本地预览效果，无需编译烧录：
+
+```bash
+node scripts/wifi-preview.js
 ```
 
-## 服务端
+浏览器打开 `http://localhost:3000`，修改 `managed_components/78__esp-wifi-connect/assets/wifi_configuration.html` 后刷新即可。模拟了 5 个 WiFi 热点 + 3 个已保存网络，OTA 和睡眠模式选项可见。
 
-本固件配合 [xiaozhi-esp32-server](https://github.com/78/xiaozhi-esp32-server) 使用。需要在服务端配置 LLM 和 TTS。
+---
 
-## 自定义
+## ⚠️ 已知问题
 
-`m5stack_core_s3.cc` 中的触摸文本、手势动作、早安问候等使用通用占位符（主人/小智）。替换成你自己的人设文本即可。
+<details>
+<summary>展开查看</summary>
 
-主要自定义点：
-- **触摸回应**：搜索 `msgs[]` 数组
-- **手势动作池**：搜索 `DoubleClickPool`、`UpSwipePool` 等函数
-- **早安问候**：搜索 `MorningLoop`
-- **情绪灯颜色**：搜索 `UpdateLedsFromEmotion`
+1. **电池供电 + 灯全亮可能无法开机** —— 插 USB 再开机
+2. **LLM 控灯偶尔卡住 / 口头说调灯实际不动** —— prompt 优化中
+3. **烧录后需物理重启** —— 拔 USB 关机，等 30 秒再插电
+4. **唤醒词灵敏度需自行调整** —— 生僻词选 High，常见词选 Medium
+5. **自部署服务端注意安全**：`auth.enabled=true`、MAC 白名单、API Key 不暴露、端口不裸奔
 
-## 致谢
+</details>
+
+---
+
+## 📋 更新日志
+
+<details>
+<summary>展开查看</summary>
+
+- **2026-06-16** · **v0.0.2** 发布
+- **2026-06-16** · 配网页面持续美化：🤖 机器人图标 + "StackChan 网络配置"品牌标识 + 日夜主题切换（自动/浅色/深色）+ 信号柱状条分色重绘 + 语言精简为中英文；新增 `self.face.expression` MCP 工具（19 种表情）+ `self.get_system_info` 改为通用工具；配网连接超时 60s → 10s + 连续 3 次失败自动清除失效凭据 + Idle 长按进配网时清空旧 WiFi；本地预览服务器 `node scripts/wifi-preview.js`
+- **2026-06-16** · esp-wifi-connect v3.1.5 → v3.2.1：CSS 变量设计令牌 + 暗色模式 + 渐变背景 + 扫描动画 + 45 种语言；开启 OTA 配置和休眠模式可见性
+- **2026-06-15** · 配网页面（192.168.4.1）美化：iOS 风格分段按钮 + 大圆角卡片 + 信号强度可视化 + StackChan 品牌标识
+- **2026-06-11** · 修复休眠机制（恢复空闲检查，对话中不再误休眠，超时 60s → 30s）；Idle 长按屏幕 5 秒进入配网模式；说话时屏蔽 BMI270 体感避免舵机晃动误触 IMU
+- **2026-06-10** · 编译修复 + 版本检查重试优化（`MAX_RETRY=1`）+ 默认 WebSocket 协议；触摸/SendUserText 长文本拦截修复（≤24 字节）；屏蔽 OTA 远程升级；体感池拆 `display+tag`、删早安问候、删 `upgrade_firmware` MCP 工具
+- **2026-06-06** · 唤醒词灵敏度 Low/Medium/High 三档；文本打断优化；休眠背光彻底熄灭；SPIRAM 改回 QUAD
+
+</details>
+
+---
+
+## 🙏 致谢
 
 - [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) — 基础固件
-- [M5Stack StackChan-BSP](https://github.com/m5stack/StackChan-BSP) — SI12T 驱动参考
-- [TS12 Datasheet](http://file2.dzsc.com/product/18/09/06/1114361_130715119.pdf) — 触摸传感器寄存器文档
+- [xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) — 服务端
+- [M5Stack StackChan-BSP](https://github.com/m5stack/StackChan-BSP) — SI12T 参考
+- [esp-wifi-connect](https://github.com/78/esp-wifi-connect) — WiFi 配网组件
 
-## License
+## 📄 License
 
 同上游 [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)。
-
