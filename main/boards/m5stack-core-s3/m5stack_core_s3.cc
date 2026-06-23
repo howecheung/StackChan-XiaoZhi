@@ -1417,6 +1417,9 @@ private:
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!bmi_handle_) continue;
 
+            // 深度睡眠时屏蔽体感唤醒（仅点击屏幕可唤醒）
+            if (in_deep_sleep_) continue;
+
             struct bmi2_sens_data accel;
             int8_t rd = bmi2_get_sensor_data(&accel, bmi_handle_);
             if (rd != BMI2_OK) {
@@ -1641,6 +1644,10 @@ private:
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!si12t_dev_) continue;
+
+            // 深度睡眠时屏蔽顶部触摸唤醒（仅点击屏幕可唤醒）
+            if (in_deep_sleep_) continue;
+
             uint8_t out = Si12tReadReg(0x10);
             int64_t now = esp_timer_get_time();
             for (int zone = 0; zone < 3; zone++) {

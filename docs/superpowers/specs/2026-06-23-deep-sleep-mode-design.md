@@ -185,7 +185,28 @@ if in_deep_sleep_:
 
 **为何用独立 static 变量**: 现有 `was_touched` 跨睡眠/唤醒语义混乱; 独立变量完全隔离睡眠态触摸状态, 不污染现有手势状态机。
 
-### 4.5 唤醒动作 (`WakeUpFromDeepSleep` 新增私有方法)
+### 4.5 体感 / 顶部触摸睡眠守卫
+
+BMI270 体感 (`MotionLoop`) 和 SI12T 顶部触摸 (`Si12tLoop`) 是独立的 FreeRTOS 任务,
+各自在 100ms 心跳循环中检测动作并调用 `SendUserMessage` → Idle 下走 `WakeWordInvoke` 唤醒设备。
+深度睡眠时必须屏蔽这两条路径, 否则摇晃机器人或摸头仍会唤醒。
+
+**做法**: 在两个循环的心跳点 (`vTaskDelay` 之后、检测逻辑之前) 各插一行守卫:
+```cpp
+if (in_deep_sleep_) continue;
+```
+
+| 循环 | 位置 | 效果 |
+|---|---|---|
+| `MotionLoop` (BMI270) | `vTaskDelay(100)` 之后 | 摇晃/抱起不触发唤醒 |
+| `Si12tLoop` (SI12T) | `vTaskDelay(100)` 之后 | 摸头不触发唤醒 |
+
+**不影响其他功能**:
+- 两行守卫只在 `in_deep_sleep_ == true` 时生效, 唤醒后 (`in_deep_sleep_ = false`) 循环照常运行
+- 两个循环的内部状态 (`still_count`, `lift_count`, `si12t_last_state_` 等) 在睡眠期间继续自然演进,
+  唤醒后可能有一次"清零过渡", 但无功能影响 (有 `TOUCH_COOLDOWN_US` 和 `STILL_SAMPLES_TO_REARM` 兜底)
+
+### 4.6 唤醒动作 (`WakeUpFromDeepSleep` 新增私有方法)
 
 ```cpp
 void WakeUpFromDeepSleep() {
@@ -198,7 +219,7 @@ void WakeUpFromDeepSleep() {
 - `WakeUp()` 内部调 `on_exit_sleep_mode_` (恢复外设 + 清 `in_deep_sleep_`) 并复位 tick → "恢复外设"和"重置 30 秒计时"原子
 - `ToggleChatState` 用 `GetDefaultListeningMode()` (自动停止), 内部切 PERFORMANCE 降延迟; 走已建立 WebSocket, <1 秒进聆听
 
-### 4.6 唤醒后时序 (用户体感)
+### 4.7 唤醒后时序 (用户体感)
 
 | 时刻 | 现象 |
 |---|---|
@@ -210,11 +231,11 @@ void WakeUpFromDeepSleep() {
 
 **流畅性来源**: §1 决策"WiFi+连接全保持", `OpenAudioChannel` 无重连开销。
 
-### 4.7 对话结束后 (无需额外代码)
+### 4.8 对话结束后 (无需额外代码)
 
 对话走完正常流程回 `kDeviceStateIdle` → `PowerSaveTimer` 重新 30 秒计时 → 再次深度睡眠。完全复用现有周期。
 
-### 4.8 失败兜底
+### 4.9 失败兜底
 
 - `ToggleChatState` 协议未就绪 (`protocol_==null`): 现有 `HandleToggleChatEvent` `ESP_LOGE` 并 return, 设备停 Idle, 30 秒后再睡。不卡死。
 - 唤醒时 WiFi 恰断: 现有 `HandleNetworkDisconnectedEvent` 关音频通道, `ToggleChatState` 安全返回。不崩溃。
@@ -270,7 +291,7 @@ int64_t deep_sleep_enter_us_ = 0;
 | 现有 `OnEnterSleepMode` | 关背光/LED/舵机逻辑全保留, 仅新增关唤醒词+置标志 |
 | 现有 `OnExitSleepMode` | 恢复逻辑全保留, 顺序微调+注释, 新增唤醒词恢复 |
 | 唤醒词配置 | 不碰 sdkconfig, 唤醒词仅睡眠态关, 唤醒后照常 |
-| 体感 BMI270 / SI12T | 不碰; 睡眠态触发走 WakeWordInvoke (bonus: 体感也能唤醒) |
+| 体感 BMI270 / SI12T | 睡眠态各加 `if (in_deep_sleep_) continue;` 守卫, 唤醒后照常运行 |
 | 配网 (Idle 长按 5 秒) | 不碰; 睡眠态长_press 走 armed 逻辑不误触配网 |
 | 低电量告警 | 不碰, `batt_timer` 照常 |
 | OTA / 激活 | 0 改动 |
