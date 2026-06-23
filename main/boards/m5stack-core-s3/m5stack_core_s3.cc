@@ -1340,6 +1340,9 @@ private:
     uint8_t si12t_last_state_ = 0;
     bool servo_ok_ = false;
     bool low_batt_warned_ = false;
+    // ---- 深度睡眠态（屏/LED/舵机/唤醒词全关，仅点击屏唤醒）----
+    volatile bool in_deep_sleep_ = false;   // 是否处于深度睡眠
+    int64_t deep_sleep_enter_us_ = 0;       // 进入睡眠时刻，用于触摸避让判定
 
     void InitializeBmi270() {
         // BMI270 实际在 0x69（不是 SDK 默认的 0x68），自己用 IDF i2c API + 底层 bmi270_init 绕过硬编码
@@ -1735,6 +1738,7 @@ private:
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 30, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
+            // 关外设：屏幕驱动 / 背光 / 舵机扫视 / LED 环
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(0);
             servo_.PauseScan();
@@ -1742,8 +1746,19 @@ private:
                 uint16_t off[12] = {};
                 Py32SetLedFrame(off, 12);
             }
+            // 深度睡眠新增：关唤醒词检测 + 置深度睡眠标志
+            auto& app = Application::GetInstance();
+            if (app.GetAudioService().IsWakeWordRunning()) {
+                app.GetAudioService().EnableWakeWordDetection(false);
+            }
+            in_deep_sleep_ = true;
+            deep_sleep_enter_us_ = esp_timer_get_time();
+            ESP_LOGI(TAG, "Deep sleep entered (LED/servo/wakeword/screen off)");
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            // 先清标志：恢复过程中任何触摸走正常手势分支，不进睡眠守卫
+            in_deep_sleep_ = false;
+            // 恢复外设（顺序：先显示驱动再亮背光，避免花屏一瞬间）
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
             servo_.ResumeScan();
@@ -1753,6 +1768,9 @@ private:
                 for (int i = 0; i < 12; i++) colors[i] = neutral;
                 Py32SetLedFrame(colors, 12);
             }
+            // 深度睡眠新增：恢复唤醒词检测（回到 Idle 待机后照常工作）
+            Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
+            ESP_LOGI(TAG, "Deep sleep exited");
         });
         power_save_timer_->OnShutdownRequest([this]() {
         });
@@ -1942,6 +1960,15 @@ private:
         Application::GetInstance().SendUserText(msg);
     }
 
+    // 深度睡眠唤醒：恢复外设 + 进入聆听
+    // WakeUp() 内部触发 OnExitSleepMode（恢复外设并清 in_deep_sleep_）并复位 30 秒计时；
+    // ToggleChatState 事件驱动、线程安全，走已建立的 WebSocket，<1 秒进聆听。
+    void WakeUpFromDeepSleep() {
+        ESP_LOGI(TAG, "Wake up from deep sleep by screen tap");
+        power_save_timer_->WakeUp();
+        Application::GetInstance().ToggleChatState();
+    }
+
     void PollTouchpad() {
         static bool was_touched = false;
         static int64_t touch_start_time = 0;
@@ -1962,6 +1989,44 @@ private:
         ft6336_->UpdateTouchPoint();
         auto& touch_point = ft6336_->GetTouchPoint();
         int64_t now = esp_timer_get_time() / 1000;
+
+        // ==== 深度睡眠态触摸短路守卫 ====
+        // 睡眠时屏/LED/舵机/唤醒词全关，唯一唤醒方式是点击屏幕。
+        // 用独立 static 变量跟踪睡眠态触摸状态，不污染下方现有手势识别状态机。
+        static bool sleep_touch_armed = false;     // 进入 armed：等待"下一次新按下"
+        static bool sleep_press_seen = false;      // 已捕获睡眠期按下，等抬起
+        static int64_t sleep_press_down_us = 0;
+
+        if (in_deep_sleep_) {
+            int64_t now_us = esp_timer_get_time();
+            if (touch_point.num > 0 && !sleep_touch_armed) {
+                // 睡眠期首次出现按下 —— 判定是否"睡着那一刻手还在屏上"
+                // 避让规则：进入睡眠后 800ms 内的按下视为残留触摸，丢弃并 arm
+                if (now_us - deep_sleep_enter_us_ < 800000) {
+                    sleep_touch_armed = true;
+                    sleep_press_seen = false;
+                } else {
+                    // 真正的唤醒点击候选，等抬起
+                    sleep_press_seen = true;
+                    sleep_press_down_us = now_us;
+                }
+                return;
+            }
+            if (touch_point.num > 0 && sleep_touch_armed) {
+                // armed 模式下的新按下 → 唤醒候选
+                sleep_press_seen = true;
+                sleep_press_down_us = now_us;
+                return;
+            }
+            if (touch_point.num == 0 && sleep_press_seen) {
+                // 抬起 → 唤醒！
+                sleep_press_seen = false;
+                sleep_touch_armed = false;
+                WakeUpFromDeepSleep();
+                return;
+            }
+            return;  // 睡眠态无有效按下，啥也不做
+        }
 
         // 待定单击超过双击窗口 → 执行单击（ToggleChat）
         if (pending_single_release && (now - pending_single_release_time) > DOUBLE_CLICK_MS) {
