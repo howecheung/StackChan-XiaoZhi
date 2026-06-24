@@ -1461,8 +1461,9 @@ private:
 
             still_count = 0;
 
-            // 设备说话时忽略体感（舵机晃动会触发 IMU 误检测）
-            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) continue;
+            // 设备说话/聆听时忽略体感（舵机晃动会触发 IMU 误检测）
+            auto motion_state = Application::GetInstance().GetDeviceState();
+            if (motion_state == kDeviceStateSpeaking || motion_state == kDeviceStateListening) continue;
 
             if (!armed) continue;  // 已触发过，等静止 re-arm
             // 全局冷却：上次触发后 5 分钟内任何情况都不再触发
@@ -1647,6 +1648,10 @@ private:
 
             // 深度睡眠时屏蔽顶部触摸唤醒（仅点击屏幕可唤醒）
             if (in_deep_sleep_) continue;
+
+            // 说话/聆听时忽略顶部触摸，避免误打断语音交互
+            auto touch_state = Application::GetInstance().GetDeviceState();
+            if (touch_state == kDeviceStateSpeaking || touch_state == kDeviceStateListening) continue;
 
             uint8_t out = Si12tReadReg(0x10);
             int64_t now = esp_timer_get_time();
