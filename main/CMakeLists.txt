@@ -1012,6 +1012,8 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        nvs_flash
+                        esp-wifi-connect
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
