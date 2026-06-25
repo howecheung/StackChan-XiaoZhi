@@ -36,21 +36,22 @@
 
 ## 🚀 快速开始
 
-从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载 `bootloader.bin`、`partition-table.bin`、`ota_data_initial.bin`、`xiaozhi.bin`，一行命令烧录：
+### 安装 ESP-IDF
 
-```bash
-pip install esptool
-esptool.py --chip esp32s3 -p COM4 -b 460800 \
-  --before default_reset --after hard_reset \
-  write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x0       bootloader.bin \
-  0x8000    partition-table.bin \
-  0xd000    ota_data_initial.bin \
-  0x410000  xiaozhi.bin \
-  0x10000   model.bin \
-  0xA10000  assets.bin
+1. 下载 [ESP-IDF v5.5 离线安装器](https://dl.espressif.com/dl/esp-idf/)（选 `ESP-IDF v5.5.x Offline Installer`）
+2. 安装时勾选 ESP32-S3 芯片支持，一路下一步即可
+3. 安装完成后在开始菜单搜索 **"ESP-IDF 5.5 CMD"**，打开这个终端
+
+### 烧录固件
+
+从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载 `StackChan-XiaoZhi-v0.0.3.zip`，解压后在 **ESP-IDF 5.5 CMD** 中进入解压目录执行：
+
+```bat
+esptool.py --chip esp32s3 -p COM4 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0xd000 ota_data_initial.bin 0x410000 xiaozhi.bin 0x10000 model.bin 0xA10000 assets.bin
 ```
 
+> **必须用 ESP-IDF 5.5 CMD**，普通 cmd 没有 `esptool.py` 环境。
+>
 > `COM4` 换成实际串口号。首次烧录建议先 `esptool.py erase_flash` 清空旧配置。
 
 ---
