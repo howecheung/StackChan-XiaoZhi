@@ -46,7 +46,8 @@ esptool.py --chip esp32s3 -p COM4 -b 460800 \
   0x0       bootloader.bin \
   0x8000    partition-table.bin \
   0xd000    ota_data_initial.bin \
-  0x410000  xiaozhi.bin
+  0x410000  xiaozhi.bin \
+  0xA10000  assets.bin
 ```
 
 > `COM4` 换成实际串口号。首次烧录建议先 `esptool.py erase_flash` 清空旧配置。
