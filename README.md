@@ -47,6 +47,7 @@ esptool.py --chip esp32s3 -p COM4 -b 460800 \
   0x8000    partition-table.bin \
   0xd000    ota_data_initial.bin \
   0x410000  xiaozhi.bin \
+  0x10000   model.bin \
   0xA10000  assets.bin
 ```
 
