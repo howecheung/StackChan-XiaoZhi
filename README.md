@@ -44,7 +44,7 @@
 
 ### 烧录固件
 
-从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载 `StackChan-XiaoZhi-v0.0.3.zip`，解压后在 **ESP-IDF 5.5 CMD** 中进入解压目录执行：
+从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载最新版本 ZIP，解压后在 **ESP-IDF 5.5 CMD** 中进入解压目录执行：
 
 ```bat
 esptool.py --chip esp32s3 -p COM4 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0xd000 ota_data_initial.bin 0x410000 xiaozhi.bin 0x10000 model.bin 0xA10000 assets.bin
@@ -110,7 +110,7 @@ idf.py build flash
 node scripts/wifi-preview.js
 ```
 
-浏览器打开 `http://localhost:3000`，修改 `managed_components/78__esp-wifi-connect/assets/wifi_configuration.html` 后刷新即可。模拟了 5 个 WiFi 热点 + 3 个已保存网络，OTA 和睡眠模式选项可见。
+浏览器打开 `http://localhost:3000`，修改 `components/esp-wifi-connect/assets/wifi_configuration.html` 后刷新即可。模拟了 5 个 WiFi 热点 + 3 个已保存网络，OTA 和睡眠模式选项可见。
 
 ---
 
@@ -134,6 +134,8 @@ node scripts/wifi-preview.js
 <details>
 <summary>展开查看</summary>
 
+- **2026-06-25** · **v0.0.3** 发布
+- **2026-06-25** · 修复 WiFi NVS 写入失效（失败计数无法持久化）；BMI270 体感检测扩展至聆听状态屏蔽；SI12T 顶部触摸新增说话/聆听时忽略，避免误打断；esp-wifi-connect 组件纳入项目源码，不再从远程下载；编译产物发布格式改为 ZIP，新增 model.bin + assets.bin 分区
 - **2026-06-23** · 深度睡眠模式：30 秒空闲进入深度睡眠（黑屏静音），点击屏幕唤醒进聆听模式；屏蔽体感 BMI270 摇晃/抱起和顶部触摸 SI12T 的睡眠误唤醒路径
 - **2026-06-16** · **v0.0.2** 发布
 - **2026-06-16** · 配网页面持续美化：🤖 机器人图标 + "StackChan 网络配置"品牌标识 + 日夜主题切换（自动/浅色/深色）+ 信号柱状条分色重绘 + 语言精简为中英文；新增 `self.face.expression` MCP 工具（19 种表情）+ `self.get_system_info` 改为通用工具；配网连接超时 60s → 10s + 连续 3 次失败自动清除失效凭据 + Idle 长按进配网时清空旧 WiFi；本地预览服务器 `node scripts/wifi-preview.js`
