@@ -10,7 +10,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = 3000;
-const HTML_DIR = path.join(__dirname, "..", "managed_components/78__esp-wifi-connect/assets");
+const HTML_DIR = path.join(__dirname, "..", "components/esp-wifi-connect/assets");
 
 const MOCK_SCAN = {
   support_5g: false,
