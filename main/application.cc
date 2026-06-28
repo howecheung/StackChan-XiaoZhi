@@ -288,7 +288,7 @@ void Application::HandleNetworkDisconnectedEvent() {
     auto state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
-        protocol_->CloseAudioChannel();
+        if (protocol_) protocol_->CloseAudioChannel();
     }
 
     // Update the status bar immediately to show the network state

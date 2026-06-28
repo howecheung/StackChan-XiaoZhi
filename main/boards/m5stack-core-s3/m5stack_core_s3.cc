@@ -15,6 +15,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
+#include <nvs.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,8 @@ static void Bmi270DelayUs(uint32_t period_us, void *intf_ptr) {
 }
 
 #define TAG "M5StackCoreS3Board"
+// SI12T 触摸灵敏度: 0(最低)~7(最高), 越大越灵敏, 推荐 4
+#define SI12T_SENSITIVITY_LEVEL 4
 
 class FaceTracker;
 
@@ -66,7 +69,10 @@ public:
             return false;
         }
         ESP_LOGI("Servo", "SCS bus init OK on UART1 GPIO6/7 @1Mbps");
-        MoveTo(0, 30, 1500);
+
+        // Load calibrated zero from NVS, fall back to default (yaw=0, pitch=30)
+        LoadZeroCalibration();
+        MoveTo(yaw_zero_, pitch_zero_, 1500);
 
         esp_timer_create_args_t args = {};
         args.callback = &StackChanServo::IdleScanCb;
@@ -105,7 +111,7 @@ public:
         }
     }
 
-    void Center() { MoveTo(0, 30, 600); }
+    void Center() { MoveTo(yaw_zero_, pitch_zero_, 600); }
 
     void SetFaceTracker(FaceTracker* ft) { tracker_ = ft; }
 
@@ -118,10 +124,35 @@ public:
 private:
     static void IdleScanCb(void* arg) {
         auto* self = static_cast<StackChanServo*>(arg);
-        int yaw = (rand() % 51) - 25;
-        int pitch = 25 + (rand() % 11);
+        int yaw = (rand() % 81) - 40;     // -40° ~ +40°
+        int pitch = 10 + (rand() % 31);   // 10° ~ 40°
         self->MoveTo(yaw, pitch, 1500);
     }
+
+    void LoadZeroCalibration() {
+        nvs_handle_t nvs;
+        if (nvs_open("servo", NVS_READONLY, &nvs) == ESP_OK) {
+            int8_t v;
+            if (nvs_get_i8(nvs, "yaw_zero", &v) == ESP_OK && v >= -20 && v <= 20) yaw_zero_ = v;
+            if (nvs_get_i8(nvs, "pitch_zero", &v) == ESP_OK && v >= 10 && v <= 50) pitch_zero_ = v;
+            nvs_close(nvs);
+        }
+        ESP_LOGI("Servo", "Zero calibration: yaw=%d pitch=%d", yaw_zero_, pitch_zero_);
+    }
+
+    void SaveZeroCalibration() {
+        nvs_handle_t nvs;
+        if (nvs_open("servo", NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_set_i8(nvs, "yaw_zero", (int8_t)yaw_zero_);
+            nvs_set_i8(nvs, "pitch_zero", (int8_t)pitch_zero_);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+            ESP_LOGI("Servo", "Zero calibration saved: yaw=%d pitch=%d", yaw_zero_, pitch_zero_);
+        }
+    }
+
+    int8_t yaw_zero_ = 0;      // 出厂零点（水平舵机）
+    int8_t pitch_zero_ = 30;   // 出厂零点（垂直舵机）
 
     SCSCL bus_;
     esp_timer_handle_t idle_timer_ = nullptr;
@@ -1295,7 +1326,14 @@ public:
     }
 
     void UpdateTouchPoint() {
-        ReadRegs(0x02, read_buffer_, 6);
+        // 重试机制：FT6336 在 I2C 总线繁忙时会偶发超时
+        esp_err_t ret = ESP_FAIL;
+        for (int i = 0; i < 3; i++) {
+            ret = i2c_master_transmit_receive(i2c_device_, &reg, 1, read_buffer_, 6, 50);
+            if (ret == ESP_OK) break;
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        if (ret != ESP_OK) return;  // 所有重试失败，保留旧触摸状态
         tp_.num = read_buffer_[0] & 0x0F;
         tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
         tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
@@ -1306,6 +1344,7 @@ public:
     }
 
 private:
+    uint8_t reg = 0x02;  // 触摸数据起始寄存器，I2C 读命令用
     uint8_t* read_buffer_ = nullptr;
     TouchPoint_t tp_;
 };
@@ -1327,6 +1366,7 @@ private:
     // ---- PY32 持久 I2C 设备句柄（控 LED + 其他扩展）----
     i2c_master_dev_handle_t py32_dev_ = nullptr;
     bool led_manual_ = false;
+    int64_t led_manual_since_ = 0;  // 手动模式开始时间，看门狗用
     // ---- BMI270 (IMU) ----
     i2c_master_dev_handle_t bmi_i2c_dev_ = nullptr;
     struct bmi2_dev bmi_dev_storage_ = {};
@@ -1461,9 +1501,8 @@ private:
 
             still_count = 0;
 
-            // 设备说话/聆听时忽略体感（舵机晃动会触发 IMU 误检测）
-            auto motion_state = Application::GetInstance().GetDeviceState();
-            if (motion_state == kDeviceStateSpeaking || motion_state == kDeviceStateListening) continue;
+            // 设备说话时忽略体感（舵机晃动会触发 IMU 误检测）
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) continue;
 
             if (!armed) continue;  // 已触发过，等静止 re-arm
             // 全局冷却：上次触发后 5 分钟内任何情况都不再触发
@@ -1533,6 +1572,28 @@ private:
         ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
     }
 
+    void LedSelfTest() {
+        if (!py32_dev_) return;
+        uint16_t red[12], green[12], blue[12], white[12];
+        for (int i = 0; i < 12; i++) {
+            red[i]   = Rgb888To565(255, 0, 0);
+            green[i] = Rgb888To565(0, 255, 0);
+            blue[i]  = Rgb888To565(0, 0, 255);
+            white[i] = Rgb888To565(255, 255, 255);
+        }
+        ESP_LOGI(TAG, "LED self-test: red");
+        Py32SetLedFrame(red, 12);   vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "LED self-test: green");
+        Py32SetLedFrame(green, 12); vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "LED self-test: blue");
+        Py32SetLedFrame(blue, 12);  vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "LED self-test: white");
+        Py32SetLedFrame(white, 12); vTaskDelay(pdMS_TO_TICKS(200));
+        uint16_t off[12] = {};
+        Py32SetLedFrame(off, 12);
+        ESP_LOGI(TAG, "LED self-test: done (all 12 OK)");
+    }
+
     bool Py32WriteRegBlock(uint8_t reg, const uint8_t* data, size_t len) {
         if (!py32_dev_) return false;
         static uint8_t buf[80];
@@ -1562,7 +1623,16 @@ private:
 
     void UpdateLedsFromEmotion(const char* emotion) {
         if (!py32_dev_) return;
-        if (led_manual_) return;
+        if (led_manual_) {
+            // 看门狗：60 秒无新操作自动切回情绪灯效
+            if (esp_timer_get_time() - led_manual_since_ > 60000000) {
+                led_manual_ = false;
+                led_manual_since_ = 0;
+                ESP_LOGI(TAG, "LED watchdog: auto-return to emotion mode");
+            } else {
+                return;
+            }
+        }
         uint8_t r, g, b;
         if (!emotion) { r=60; g=35; b=10; }
         else if (!strcmp(emotion, "happy") || !strcmp(emotion, "laughing") || !strcmp(emotion, "funny")) { r=255; g=180; b=0; }
@@ -1579,7 +1649,12 @@ private:
         else if (!strcmp(emotion, "sleepy")) { r=10; g=5; b=30; }
         else if (!strcmp(emotion, "embarrassed")) { r=255; g=80; b=120; }
         else if (!strcmp(emotion, "silly")) { r=100; g=255; b=0; }
-        else { r=60; g=35; b=10; }  // neutral 暖橙待机
+        else {
+            // neutral 暖橙待机 + 呼吸效果
+            float phase = (esp_timer_get_time() % 4000000LL) / 4000000.0f * 6.28318f;  // 4s 周期
+            float breathe = 0.5f + 0.5f * sinf(phase);  // 0.0 ~ 1.0
+            r = 60 * breathe; g = 35 * breathe; b = 10 * breathe;
+        }
 
         uint16_t color = Rgb888To565(r, g, b);
         uint16_t colors[12];
@@ -1611,7 +1686,8 @@ private:
         Si12tWriteReg(0x09, 0x07);  // CTRL2 normal
         Si12tWriteReg(0x08, 0x22);  // CTRL1
         for (uint8_t reg = 0x02; reg <= 0x07; reg++) {
-            Si12tWriteReg(reg, 0xCC);  // M5Stack BSP recommended, better EMI resistance
+            // 0x88=High sensitivity base, level 0~7 → 0x88~0xF8
+            Si12tWriteReg(reg, (uint8_t)(0x88 + SI12T_SENSITIVITY_LEVEL * 0x10));
         }
         ESP_LOGI(TAG, "SI12T 3-zone touch initialized");
 
@@ -1649,9 +1725,8 @@ private:
             // 深度睡眠时屏蔽顶部触摸唤醒（仅点击屏幕可唤醒）
             if (in_deep_sleep_) continue;
 
-            // 说话/聆听时忽略顶部触摸，避免误打断语音交互
-            auto touch_state = Application::GetInstance().GetDeviceState();
-            if (touch_state == kDeviceStateSpeaking || touch_state == kDeviceStateListening) continue;
+            // 说话时忽略顶部触摸，避免误打断语音交互
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) continue;
 
             uint8_t out = Si12tReadReg(0x10);
             int64_t now = esp_timer_get_time();
@@ -1724,6 +1799,7 @@ private:
                 for (int i = 0; i < 12; i++) colors[i] = color;
                 Py32SetLedFrame(colors, 12);
                 led_manual_ = true;
+                led_manual_since_ = esp_timer_get_time();
                 ESP_LOGI(TAG, "MCP set LED color: r=%d g=%d b=%d", r, g, b);
                 return true;
             });
@@ -1734,6 +1810,7 @@ private:
                 uint16_t off[12] = {};
                 Py32SetLedFrame(off, 12);
                 led_manual_ = true;
+                led_manual_since_ = esp_timer_get_time();
                 ESP_LOGI(TAG, "MCP LED off");
                 return true;
             });
@@ -1742,6 +1819,7 @@ private:
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 led_manual_ = false;
+                led_manual_since_ = 0;
                 ESP_LOGI(TAG, "MCP LED auto mode");
                 return true;
             });
@@ -1806,7 +1884,9 @@ private:
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
 
+#ifdef DEBUG_I2C
     void I2cDetect() {
+        int64_t start = esp_timer_get_time();
         uint8_t address;
         printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\r\n");
         for (int i = 0; i < 128; i += 16) {
@@ -1814,7 +1894,7 @@ private:
             for (int j = 0; j < 16; j++) {
                 fflush(stdout);
                 address = i + j;
-                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(200));
+                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(100));
                 if (ret == ESP_OK) {
                     printf("%02x ", address);
                 } else if (ret == ESP_ERR_TIMEOUT) {
@@ -1825,7 +1905,9 @@ private:
             }
             printf("\r\n");
         }
+        ESP_LOGI(TAG, "I2C scan took %lld ms", (esp_timer_get_time() - start) / 1000);
     }
+#endif
 
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
@@ -2241,13 +2323,16 @@ public:
         InitializeI2c();
         InitializeAxp2101();
         InitializeAw9523();
+#ifdef DEBUG_I2C
         I2cDetect();
+#endif
 
         py32_found_ = EnableServoPowerViaPy32(i2c_bus_);
         if (py32_found_) {
             vTaskDelay(pdMS_TO_TICKS(200));
             servo_ok_ = servo_.Begin();
             InitializePy32LedDevice();
+            LedSelfTest();
             RegisterLedMcpTools();
             RegisterExpressionMcpTool();
         }
