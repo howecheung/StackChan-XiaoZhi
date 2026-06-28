@@ -56,8 +56,7 @@ static void Bmi270DelayUs(uint32_t period_us, void *intf_ptr) {
 }
 
 #define TAG "M5StackCoreS3Board"
-// SI12T 触摸灵敏度: 0(最低)~7(最高), 越大越灵敏, 推荐 4
-#define SI12T_SENSITIVITY_LEVEL 4
+// SI12T 灵敏度参考 BSP level 4 (0xCC), 范围 0(0x88)~7(0xFF)
 
 class FaceTracker;
 
@@ -177,6 +176,7 @@ public:
     }
 
     void Pause(bool resume_scan = true) {
+        if (disabled_) return;
         if (!paused_) {
             paused_ = true;
             tracking_ = false;
@@ -186,6 +186,7 @@ public:
     }
 
     void Resume() {
+        if (disabled_) return;
         if (paused_) {
             paused_ = false;
             has_prev_ = false;
@@ -194,7 +195,20 @@ public:
         }
     }
 
+    void SetDisabled(bool disabled) {
+        if (disabled) {
+            Pause(false);       // 先暂停再设标志，否则 Pause 被自己的 disabled_ 挡掉
+            servo_->Center();
+        }
+        disabled_ = disabled;
+        if (!disabled) {
+            Resume();           // 解除禁用后恢复追踪
+        }
+        ESP_LOGI("FaceTrack", "Tracking %s", disabled ? "DISABLED" : "ENABLED");
+    }
+
     bool IsPaused() const { return paused_; }
+    bool disabled_ = false;
     float GetYaw() const { return yaw_; }
     float GetPitch() const { return pitch_; }
 
@@ -1685,9 +1699,8 @@ private:
         vTaskDelay(pdMS_TO_TICKS(10));
         Si12tWriteReg(0x09, 0x07);  // CTRL2 normal
         Si12tWriteReg(0x08, 0x22);  // CTRL1
-        for (uint8_t reg = 0x02; reg <= 0x07; reg++) {
-            // 0x88=High sensitivity base, level 0~7 → 0x88~0xF8
-            Si12tWriteReg(reg, (uint8_t)(0x88 + SI12T_SENSITIVITY_LEVEL * 0x10));
+        for (uint8_t reg = 0x01; reg <= 0x05; reg++) {
+            Si12tWriteReg(reg, 0xCC);  // M5Stack BSP: SENSITIVITY1~5, level 4, better EMI
         }
         ESP_LOGI(TAG, "SI12T 3-zone touch initialized");
 
@@ -1777,6 +1790,21 @@ private:
                     display->SetEmotion(emotion.c_str());
                 }
                 ESP_LOGI(TAG, "MCP face expression: %s", emotion.c_str());
+                return true;
+            });
+    }
+
+    void RegisterFaceTrackMcpTool() {
+        auto& mcp = McpServer::GetInstance();
+        mcp.AddTool("self.face_track.toggle",
+            "Toggle face tracking on or off. When off, the servo returns to center and stops following faces. When on, it resumes automatic face tracking.",
+            PropertyList({
+                Property("enabled", kPropertyTypeBoolean)
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                bool enabled = props["enabled"].value<bool>();
+                face_tracker_.SetDisabled(!enabled);
+                ESP_LOGI(TAG, "MCP face track: %s", enabled ? "ON" : "OFF");
                 return true;
             });
     }
@@ -2335,6 +2363,7 @@ public:
             LedSelfTest();
             RegisterLedMcpTools();
             RegisterExpressionMcpTool();
+            RegisterFaceTrackMcpTool();
         }
 
         InitializeSpi();
@@ -2443,6 +2472,8 @@ public:
         static CustomBacklight backlight(pmic_);
         return &backlight;
     }
+    virtual void PauseFaceTracking() override { face_tracker_.Pause(false); }
+    virtual void ResumeFaceTracking() override { face_tracker_.Resume(); }
 };
 
 DECLARE_BOARD(M5StackCoreS3Board);
