@@ -1270,6 +1270,11 @@ public:
         WriteReg(0x90, 0xBF);
         WriteReg(0x94, 33 - 5);
         WriteReg(0x95, 33 - 5);
+
+        // 长按 PWR 键关机：bit1=1 使能，bit0=0 关机（而非重启）
+        WriteReg(0x22, (ReadReg(0x22) & 0xFE) | 0x02);
+        // OFFLEVEL=0（约 4 秒），保留启动时长等其他位
+        WriteReg(0x27, ReadReg(0x27) & 0xF3);
     }
 
     void SetBrightness(uint8_t brightness) {
