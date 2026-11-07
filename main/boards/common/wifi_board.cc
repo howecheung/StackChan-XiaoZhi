@@ -158,7 +158,7 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 }
 
 static void IncrementFailureCount() {
-    Settings nvs(NVS_WIFI_NS, false);
+    Settings nvs(NVS_WIFI_NS, true);
     int cnt = nvs.GetInt(NVS_FAIL_CNT, 0) + 1;
     nvs.SetInt(NVS_FAIL_CNT, cnt);
     ESP_LOGW(TAG, "WiFi connection failure #%d", cnt);
@@ -170,7 +170,7 @@ static void IncrementFailureCount() {
 }
 
 static void ResetFailureCount() {
-    Settings nvs(NVS_WIFI_NS, false);
+    Settings nvs(NVS_WIFI_NS, true);
     nvs.SetInt(NVS_FAIL_CNT, 0);
 }
 

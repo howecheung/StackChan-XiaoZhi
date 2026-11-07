@@ -15,6 +15,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
+#include <nvs.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,7 @@ static void Bmi270DelayUs(uint32_t period_us, void *intf_ptr) {
 }
 
 #define TAG "M5StackCoreS3Board"
+// SI12T 灵敏度参考 BSP level 4 (0xCC), 范围 0(0x88)~7(0xFF)
 
 class FaceTracker;
 
@@ -66,7 +68,10 @@ public:
             return false;
         }
         ESP_LOGI("Servo", "SCS bus init OK on UART1 GPIO6/7 @1Mbps");
-        MoveTo(0, 30, 1500);
+
+        // Load calibrated zero from NVS, fall back to default (yaw=0, pitch=30)
+        LoadZeroCalibration();
+        MoveTo(yaw_zero_, pitch_zero_, 1500);
 
         esp_timer_create_args_t args = {};
         args.callback = &StackChanServo::IdleScanCb;
@@ -105,7 +110,7 @@ public:
         }
     }
 
-    void Center() { MoveTo(0, 30, 600); }
+    void Center() { MoveTo(yaw_zero_, pitch_zero_, 600); }
 
     void SetFaceTracker(FaceTracker* ft) { tracker_ = ft; }
 
@@ -118,10 +123,35 @@ public:
 private:
     static void IdleScanCb(void* arg) {
         auto* self = static_cast<StackChanServo*>(arg);
-        int yaw = (rand() % 51) - 25;
-        int pitch = 25 + (rand() % 11);
+        int yaw = (rand() % 81) - 40;     // -40° ~ +40°
+        int pitch = 10 + (rand() % 31);   // 10° ~ 40°
         self->MoveTo(yaw, pitch, 1500);
     }
+
+    void LoadZeroCalibration() {
+        nvs_handle_t nvs;
+        if (nvs_open("servo", NVS_READONLY, &nvs) == ESP_OK) {
+            int8_t v;
+            if (nvs_get_i8(nvs, "yaw_zero", &v) == ESP_OK && v >= -20 && v <= 20) yaw_zero_ = v;
+            if (nvs_get_i8(nvs, "pitch_zero", &v) == ESP_OK && v >= 10 && v <= 50) pitch_zero_ = v;
+            nvs_close(nvs);
+        }
+        ESP_LOGI("Servo", "Zero calibration: yaw=%d pitch=%d", yaw_zero_, pitch_zero_);
+    }
+
+    void SaveZeroCalibration() {
+        nvs_handle_t nvs;
+        if (nvs_open("servo", NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_set_i8(nvs, "yaw_zero", (int8_t)yaw_zero_);
+            nvs_set_i8(nvs, "pitch_zero", (int8_t)pitch_zero_);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+            ESP_LOGI("Servo", "Zero calibration saved: yaw=%d pitch=%d", yaw_zero_, pitch_zero_);
+        }
+    }
+
+    int8_t yaw_zero_ = 0;      // 出厂零点（水平舵机）
+    int8_t pitch_zero_ = 30;   // 出厂零点（垂直舵机）
 
     SCSCL bus_;
     esp_timer_handle_t idle_timer_ = nullptr;
@@ -146,6 +176,7 @@ public:
     }
 
     void Pause(bool resume_scan = true) {
+        if (disabled_) return;
         if (!paused_) {
             paused_ = true;
             tracking_ = false;
@@ -155,6 +186,7 @@ public:
     }
 
     void Resume() {
+        if (disabled_) return;
         if (paused_) {
             paused_ = false;
             has_prev_ = false;
@@ -163,7 +195,20 @@ public:
         }
     }
 
+    void SetDisabled(bool disabled) {
+        if (disabled) {
+            Pause(false);       // 先暂停再设标志，否则 Pause 被自己的 disabled_ 挡掉
+            servo_->Center();
+        }
+        disabled_ = disabled;
+        if (!disabled) {
+            Resume();           // 解除禁用后恢复追踪
+        }
+        ESP_LOGI("FaceTrack", "Tracking %s", disabled ? "DISABLED" : "ENABLED");
+    }
+
     bool IsPaused() const { return paused_; }
+    bool disabled_ = false;
     float GetYaw() const { return yaw_; }
     float GetPitch() const { return pitch_; }
 
@@ -1225,6 +1270,11 @@ public:
         WriteReg(0x90, 0xBF);
         WriteReg(0x94, 33 - 5);
         WriteReg(0x95, 33 - 5);
+
+        // 长按 PWR 键关机：bit1=1 使能，bit0=0 关机（而非重启）
+        WriteReg(0x22, (ReadReg(0x22) & 0xFE) | 0x02);
+        // OFFLEVEL=0（约 4 秒），保留启动时长等其他位
+        WriteReg(0x27, ReadReg(0x27) & 0xF3);
     }
 
     void SetBrightness(uint8_t brightness) {
@@ -1295,7 +1345,14 @@ public:
     }
 
     void UpdateTouchPoint() {
-        ReadRegs(0x02, read_buffer_, 6);
+        // 重试机制：FT6336 在 I2C 总线繁忙时会偶发超时
+        esp_err_t ret = ESP_FAIL;
+        for (int i = 0; i < 3; i++) {
+            ret = i2c_master_transmit_receive(i2c_device_, &reg, 1, read_buffer_, 6, 50);
+            if (ret == ESP_OK) break;
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        if (ret != ESP_OK) return;  // 所有重试失败，保留旧触摸状态
         tp_.num = read_buffer_[0] & 0x0F;
         tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
         tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
@@ -1306,6 +1363,7 @@ public:
     }
 
 private:
+    uint8_t reg = 0x02;  // 触摸数据起始寄存器，I2C 读命令用
     uint8_t* read_buffer_ = nullptr;
     TouchPoint_t tp_;
 };
@@ -1327,6 +1385,7 @@ private:
     // ---- PY32 持久 I2C 设备句柄（控 LED + 其他扩展）----
     i2c_master_dev_handle_t py32_dev_ = nullptr;
     bool led_manual_ = false;
+    int64_t led_manual_since_ = 0;  // 手动模式开始时间，看门狗用
     // ---- BMI270 (IMU) ----
     i2c_master_dev_handle_t bmi_i2c_dev_ = nullptr;
     struct bmi2_dev bmi_dev_storage_ = {};
@@ -1340,6 +1399,9 @@ private:
     uint8_t si12t_last_state_ = 0;
     bool servo_ok_ = false;
     bool low_batt_warned_ = false;
+    // ---- 深度睡眠态（屏/LED/舵机/唤醒词全关，仅点击屏唤醒）----
+    volatile bool in_deep_sleep_ = false;   // 是否处于深度睡眠
+    int64_t deep_sleep_enter_us_ = 0;       // 进入睡眠时刻，用于触摸避让判定
 
     void InitializeBmi270() {
         // BMI270 实际在 0x69（不是 SDK 默认的 0x68），自己用 IDF i2c API + 底层 bmi270_init 绕过硬编码
@@ -1413,6 +1475,9 @@ private:
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!bmi_handle_) continue;
+
+            // 深度睡眠时屏蔽体感唤醒（仅点击屏幕可唤醒）
+            if (in_deep_sleep_) continue;
 
             struct bmi2_sens_data accel;
             int8_t rd = bmi2_get_sensor_data(&accel, bmi_handle_);
@@ -1526,6 +1591,28 @@ private:
         ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
     }
 
+    void LedSelfTest() {
+        if (!py32_dev_) return;
+        uint16_t red[12], green[12], blue[12], white[12];
+        for (int i = 0; i < 12; i++) {
+            red[i]   = Rgb888To565(255, 0, 0);
+            green[i] = Rgb888To565(0, 255, 0);
+            blue[i]  = Rgb888To565(0, 0, 255);
+            white[i] = Rgb888To565(255, 255, 255);
+        }
+        ESP_LOGI(TAG, "LED self-test: red");
+        Py32SetLedFrame(red, 12);   vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "LED self-test: green");
+        Py32SetLedFrame(green, 12); vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "LED self-test: blue");
+        Py32SetLedFrame(blue, 12);  vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "LED self-test: white");
+        Py32SetLedFrame(white, 12); vTaskDelay(pdMS_TO_TICKS(200));
+        uint16_t off[12] = {};
+        Py32SetLedFrame(off, 12);
+        ESP_LOGI(TAG, "LED self-test: done (all 12 OK)");
+    }
+
     bool Py32WriteRegBlock(uint8_t reg, const uint8_t* data, size_t len) {
         if (!py32_dev_) return false;
         static uint8_t buf[80];
@@ -1555,7 +1642,16 @@ private:
 
     void UpdateLedsFromEmotion(const char* emotion) {
         if (!py32_dev_) return;
-        if (led_manual_) return;
+        if (led_manual_) {
+            // 看门狗：60 秒无新操作自动切回情绪灯效
+            if (esp_timer_get_time() - led_manual_since_ > 60000000) {
+                led_manual_ = false;
+                led_manual_since_ = 0;
+                ESP_LOGI(TAG, "LED watchdog: auto-return to emotion mode");
+            } else {
+                return;
+            }
+        }
         uint8_t r, g, b;
         if (!emotion) { r=60; g=35; b=10; }
         else if (!strcmp(emotion, "happy") || !strcmp(emotion, "laughing") || !strcmp(emotion, "funny")) { r=255; g=180; b=0; }
@@ -1572,7 +1668,12 @@ private:
         else if (!strcmp(emotion, "sleepy")) { r=10; g=5; b=30; }
         else if (!strcmp(emotion, "embarrassed")) { r=255; g=80; b=120; }
         else if (!strcmp(emotion, "silly")) { r=100; g=255; b=0; }
-        else { r=60; g=35; b=10; }  // neutral 暖橙待机
+        else {
+            // neutral 暖橙待机 + 呼吸效果
+            float phase = (esp_timer_get_time() % 4000000LL) / 4000000.0f * 6.28318f;  // 4s 周期
+            float breathe = 0.5f + 0.5f * sinf(phase);  // 0.0 ~ 1.0
+            r = 60 * breathe; g = 35 * breathe; b = 10 * breathe;
+        }
 
         uint16_t color = Rgb888To565(r, g, b);
         uint16_t colors[12];
@@ -1603,8 +1704,8 @@ private:
         vTaskDelay(pdMS_TO_TICKS(10));
         Si12tWriteReg(0x09, 0x07);  // CTRL2 normal
         Si12tWriteReg(0x08, 0x22);  // CTRL1
-        for (uint8_t reg = 0x02; reg <= 0x07; reg++) {
-            Si12tWriteReg(reg, 0xCC);  // M5Stack BSP recommended, better EMI resistance
+        for (uint8_t reg = 0x01; reg <= 0x05; reg++) {
+            Si12tWriteReg(reg, 0xCC);  // M5Stack BSP: SENSITIVITY1~5, level 4, better EMI
         }
         ESP_LOGI(TAG, "SI12T 3-zone touch initialized");
 
@@ -1638,6 +1739,13 @@ private:
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!si12t_dev_) continue;
+
+            // 深度睡眠时屏蔽顶部触摸唤醒（仅点击屏幕可唤醒）
+            if (in_deep_sleep_) continue;
+
+            // 说话时忽略顶部触摸，避免误打断语音交互
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) continue;
+
             uint8_t out = Si12tReadReg(0x10);
             int64_t now = esp_timer_get_time();
             for (int zone = 0; zone < 3; zone++) {
@@ -1691,6 +1799,21 @@ private:
             });
     }
 
+    void RegisterFaceTrackMcpTool() {
+        auto& mcp = McpServer::GetInstance();
+        mcp.AddTool("self.face_track.toggle",
+            "Toggle face tracking on or off. When off, the servo returns to center and stops following faces. When on, it resumes automatic face tracking.",
+            PropertyList({
+                Property("enabled", kPropertyTypeBoolean)
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                bool enabled = props["enabled"].value<bool>();
+                face_tracker_.SetDisabled(!enabled);
+                ESP_LOGI(TAG, "MCP face track: %s", enabled ? "ON" : "OFF");
+                return true;
+            });
+    }
+
     void RegisterLedMcpTools() {
         auto& mcp = McpServer::GetInstance();
         mcp.AddTool("self.led.set_color",
@@ -1709,6 +1832,7 @@ private:
                 for (int i = 0; i < 12; i++) colors[i] = color;
                 Py32SetLedFrame(colors, 12);
                 led_manual_ = true;
+                led_manual_since_ = esp_timer_get_time();
                 ESP_LOGI(TAG, "MCP set LED color: r=%d g=%d b=%d", r, g, b);
                 return true;
             });
@@ -1719,6 +1843,7 @@ private:
                 uint16_t off[12] = {};
                 Py32SetLedFrame(off, 12);
                 led_manual_ = true;
+                led_manual_since_ = esp_timer_get_time();
                 ESP_LOGI(TAG, "MCP LED off");
                 return true;
             });
@@ -1727,6 +1852,7 @@ private:
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 led_manual_ = false;
+                led_manual_since_ = 0;
                 ESP_LOGI(TAG, "MCP LED auto mode");
                 return true;
             });
@@ -1735,6 +1861,7 @@ private:
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 30, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
+            // 关外设：屏幕驱动 / 背光 / 舵机扫视 / LED 环
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(0);
             servo_.PauseScan();
@@ -1742,8 +1869,19 @@ private:
                 uint16_t off[12] = {};
                 Py32SetLedFrame(off, 12);
             }
+            // 深度睡眠新增：关唤醒词检测 + 置深度睡眠标志
+            auto& app = Application::GetInstance();
+            if (app.GetAudioService().IsWakeWordRunning()) {
+                app.GetAudioService().EnableWakeWordDetection(false);
+            }
+            in_deep_sleep_ = true;
+            deep_sleep_enter_us_ = esp_timer_get_time();
+            ESP_LOGI(TAG, "Deep sleep entered (LED/servo/wakeword/screen off)");
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            // 先清标志：恢复过程中任何触摸走正常手势分支，不进睡眠守卫
+            in_deep_sleep_ = false;
+            // 恢复外设（顺序：先显示驱动再亮背光，避免花屏一瞬间）
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
             servo_.ResumeScan();
@@ -1753,6 +1891,9 @@ private:
                 for (int i = 0; i < 12; i++) colors[i] = neutral;
                 Py32SetLedFrame(colors, 12);
             }
+            // 深度睡眠新增：恢复唤醒词检测（回到 Idle 待机后照常工作）
+            Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
+            ESP_LOGI(TAG, "Deep sleep exited");
         });
         power_save_timer_->OnShutdownRequest([this]() {
         });
@@ -1776,7 +1917,9 @@ private:
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
 
+#ifdef DEBUG_I2C
     void I2cDetect() {
+        int64_t start = esp_timer_get_time();
         uint8_t address;
         printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\r\n");
         for (int i = 0; i < 128; i += 16) {
@@ -1784,7 +1927,7 @@ private:
             for (int j = 0; j < 16; j++) {
                 fflush(stdout);
                 address = i + j;
-                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(200));
+                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(100));
                 if (ret == ESP_OK) {
                     printf("%02x ", address);
                 } else if (ret == ESP_ERR_TIMEOUT) {
@@ -1795,7 +1938,9 @@ private:
             }
             printf("\r\n");
         }
+        ESP_LOGI(TAG, "I2C scan took %lld ms", (esp_timer_get_time() - start) / 1000);
     }
+#endif
 
     void InitializeAxp2101() {
         ESP_LOGI(TAG, "Init AXP2101");
@@ -1942,6 +2087,15 @@ private:
         Application::GetInstance().SendUserText(msg);
     }
 
+    // 深度睡眠唤醒：恢复外设 + 进入聆听
+    // WakeUp() 内部触发 OnExitSleepMode（恢复外设并清 in_deep_sleep_）并复位 30 秒计时；
+    // ToggleChatState 事件驱动、线程安全，走已建立的 WebSocket，<1 秒进聆听。
+    void WakeUpFromDeepSleep() {
+        ESP_LOGI(TAG, "Wake up from deep sleep by screen tap");
+        power_save_timer_->WakeUp();
+        Application::GetInstance().ToggleChatState();
+    }
+
     void PollTouchpad() {
         static bool was_touched = false;
         static int64_t touch_start_time = 0;
@@ -1962,6 +2116,44 @@ private:
         ft6336_->UpdateTouchPoint();
         auto& touch_point = ft6336_->GetTouchPoint();
         int64_t now = esp_timer_get_time() / 1000;
+
+        // ==== 深度睡眠态触摸短路守卫 ====
+        // 睡眠时屏/LED/舵机/唤醒词全关，唯一唤醒方式是点击屏幕。
+        // 用独立 static 变量跟踪睡眠态触摸状态，不污染下方现有手势识别状态机。
+        static bool sleep_touch_armed = false;     // 进入 armed：等待"下一次新按下"
+        static bool sleep_press_seen = false;      // 已捕获睡眠期按下，等抬起
+        static int64_t sleep_press_down_us = 0;
+
+        if (in_deep_sleep_) {
+            int64_t now_us = esp_timer_get_time();
+            if (touch_point.num > 0 && !sleep_touch_armed) {
+                // 睡眠期首次出现按下 —— 判定是否"睡着那一刻手还在屏上"
+                // 避让规则：进入睡眠后 800ms 内的按下视为残留触摸，丢弃并 arm
+                if (now_us - deep_sleep_enter_us_ < 800000) {
+                    sleep_touch_armed = true;
+                    sleep_press_seen = false;
+                } else {
+                    // 真正的唤醒点击候选，等抬起
+                    sleep_press_seen = true;
+                    sleep_press_down_us = now_us;
+                }
+                return;
+            }
+            if (touch_point.num > 0 && sleep_touch_armed) {
+                // armed 模式下的新按下 → 唤醒候选
+                sleep_press_seen = true;
+                sleep_press_down_us = now_us;
+                return;
+            }
+            if (touch_point.num == 0 && sleep_press_seen) {
+                // 抬起 → 唤醒！
+                sleep_press_seen = false;
+                sleep_touch_armed = false;
+                WakeUpFromDeepSleep();
+                return;
+            }
+            return;  // 睡眠态无有效按下，啥也不做
+        }
 
         // 待定单击超过双击窗口 → 执行单击（ToggleChat）
         if (pending_single_release && (now - pending_single_release_time) > DOUBLE_CLICK_MS) {
@@ -2164,15 +2356,19 @@ public:
         InitializeI2c();
         InitializeAxp2101();
         InitializeAw9523();
+#ifdef DEBUG_I2C
         I2cDetect();
+#endif
 
         py32_found_ = EnableServoPowerViaPy32(i2c_bus_);
         if (py32_found_) {
             vTaskDelay(pdMS_TO_TICKS(200));
             servo_ok_ = servo_.Begin();
             InitializePy32LedDevice();
+            LedSelfTest();
             RegisterLedMcpTools();
             RegisterExpressionMcpTool();
+            RegisterFaceTrackMcpTool();
         }
 
         InitializeSpi();
@@ -2281,6 +2477,8 @@ public:
         static CustomBacklight backlight(pmic_);
         return &backlight;
     }
+    virtual void PauseFaceTracking() override { face_tracker_.Pause(false); }
+    virtual void ResumeFaceTracking() override { face_tracker_.Resume(); }
 };
 
 DECLARE_BOARD(M5StackCoreS3Board);

@@ -108,11 +108,16 @@ void McpServer::AddCommonTools() {
             PropertyList({
                 Property("question", kPropertyTypeString)
             }),
-            [camera](const PropertyList& properties) -> ReturnValue {
+            [camera, &board](const PropertyList& properties) -> ReturnValue {
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
 
-                if (!camera->Capture()) {
+                // 暂停人脸追踪，避免拍照时舵机抖动导致画面模糊
+                board.PauseFaceTracking();
+                bool ok = camera->Capture();
+                board.ResumeFaceTracking();
+
+                if (!ok) {
                     throw std::runtime_error("Failed to capture photo");
                 }
                 auto question = properties["question"].value<std::string>();

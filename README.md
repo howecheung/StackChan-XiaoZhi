@@ -23,7 +23,7 @@
 | 🕺 体感检测 | BMI270 | 摇晃 + 抱起互动，说话自动屏蔽，5 分钟冷却 |
 | 💡 情绪灯环 | WS2812×12 | 21 种情绪颜色，PY32 IO Expander 控制 |
 | 🎯 舵机追踪 | SCS 总线 | GC0308 人脸追踪 + 空闲扫视，对话暂停 |
-| 😴 智能休眠 | — | 30 秒空闲关灯 / 停舵机 / 熄屏，唤醒词恢复 |
+| 😴 智能休眠 | — | 30 秒空闲浅休（关灯/停舵机/熄屏）→ 60 秒深度睡眠（黑屏静音），点击屏幕唤醒进聆听 |
 | 🔌 重新配网 | — | Idle 长按屏幕 5 秒进入 192.168.4.1 配网（页面已美化，升级至 esp-wifi-connect v3.2.1，支持暗色模式） |
 | ✂️ 文本打断 | — | 对话中插文本消息，不静默丢弃 |
 | 🔧 MCP 工具 | — | LED / 音量 / 亮度 / 摄像头 / 系统信息 |
@@ -36,19 +36,22 @@
 
 ## 🚀 快速开始
 
-从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载 `bootloader.bin`、`partition-table.bin`、`ota_data_initial.bin`、`xiaozhi.bin`，一行命令烧录：
+### 安装 ESP-IDF
 
-```bash
-pip install esptool
-esptool.py --chip esp32s3 -p COM4 -b 460800 \
-  --before default_reset --after hard_reset \
-  write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x0       bootloader.bin \
-  0x8000    partition-table.bin \
-  0xd000    ota_data_initial.bin \
-  0x410000  xiaozhi.bin
+1. 下载 [ESP-IDF v5.5 离线安装器](https://dl.espressif.com/dl/esp-idf/)（选 `ESP-IDF v5.5.x Offline Installer`）
+2. 安装时勾选 ESP32-S3 芯片支持，一路下一步即可
+3. 安装完成后在开始菜单搜索 **"ESP-IDF 5.5 CMD"**，打开这个终端
+
+### 烧录固件
+
+从 [Releases](https://github.com/howecheung/StackChan-XiaoZhi/releases) 下载最新版本 ZIP，解压后在 **ESP-IDF 5.5 CMD** 中进入解压目录执行：
+
+```bat
+esptool.py --chip esp32s3 -p COM4 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0xd000 ota_data_initial.bin 0x410000 xiaozhi.bin 0x10000 model.bin 0xA10000 assets.bin
 ```
 
+> **必须用 ESP-IDF 5.5 CMD**，普通 cmd 没有 `esptool.py` 环境。
+>
 > `COM4` 换成实际串口号。首次烧录建议先 `esptool.py erase_flash` 清空旧配置。
 
 ---
@@ -107,7 +110,7 @@ idf.py build flash
 node scripts/wifi-preview.js
 ```
 
-浏览器打开 `http://localhost:3000`，修改 `managed_components/78__esp-wifi-connect/assets/wifi_configuration.html` 后刷新即可。模拟了 5 个 WiFi 热点 + 3 个已保存网络，OTA 和睡眠模式选项可见。
+浏览器打开 `http://localhost:3000`，修改 `components/esp-wifi-connect/assets/wifi_configuration.html` 后刷新即可。模拟了 5 个 WiFi 热点 + 3 个已保存网络，OTA 和睡眠模式选项可见。
 
 ---
 
@@ -131,6 +134,9 @@ node scripts/wifi-preview.js
 <details>
 <summary>展开查看</summary>
 
+- **2026-06-25** · **v0.0.3** 发布
+- **2026-06-25** · 修复 WiFi NVS 写入失效（失败计数无法持久化）；BMI270 体感检测扩展至聆听状态屏蔽；SI12T 顶部触摸新增说话/聆听时忽略，避免误打断；esp-wifi-connect 组件纳入项目源码，不再从远程下载；编译产物发布格式改为 ZIP，新增 model.bin + assets.bin 分区
+- **2026-06-23** · 深度睡眠模式：30 秒空闲进入深度睡眠（黑屏静音），点击屏幕唤醒进聆听模式；屏蔽体感 BMI270 摇晃/抱起和顶部触摸 SI12T 的睡眠误唤醒路径
 - **2026-06-16** · **v0.0.2** 发布
 - **2026-06-16** · 配网页面持续美化：🤖 机器人图标 + "StackChan 网络配置"品牌标识 + 日夜主题切换（自动/浅色/深色）+ 信号柱状条分色重绘 + 语言精简为中英文；新增 `self.face.expression` MCP 工具（19 种表情）+ `self.get_system_info` 改为通用工具；配网连接超时 60s → 10s + 连续 3 次失败自动清除失效凭据 + Idle 长按进配网时清空旧 WiFi；本地预览服务器 `node scripts/wifi-preview.js`
 - **2026-06-16** · esp-wifi-connect v3.1.5 → v3.2.1：CSS 变量设计令牌 + 暗色模式 + 渐变背景 + 扫描动画 + 45 种语言；开启 OTA 配置和休眠模式可见性
