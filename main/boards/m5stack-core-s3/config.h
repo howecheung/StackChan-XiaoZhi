@@ -61,6 +61,23 @@
 
 #define XCLK_FREQ_HZ 20000000
 
- 
+// ---------------------------------------------------------------- StackChan base
+
+// The servo neck: two Feetech SCS0009 on one half-duplex serial bus.
+#define SERVO_UART_NUM UART_NUM_1
+#define SERVO_BAUDRATE 1000000
+#define SERVO_TX_PIN 6
+#define SERVO_RX_PIN 7
+#define SERVO_YAW_ID 1
+#define SERVO_PITCH_ID 2
+
+// PY32 pin 0 gates the servo supply (VM EN). The SCS0009 needs ~200 ms after power-up
+// before it answers, so the pin is asserted and then left alone for this long.
+#define SERVO_POWER_WAKE_MS 250
+
+// Pitch is the axis that can drive into a mechanical end stop, so it is clamped at the
+// input boundary and again at the servo-write boundary.
+#define SAFE_PITCH_MIN 5
+#define SAFE_PITCH_MAX 60
 
 #endif // _BOARD_CONFIG_H_

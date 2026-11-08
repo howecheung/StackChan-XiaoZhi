@@ -21,7 +21,7 @@
 #include <string.h>
 #include "esp_video.h"
 #include "lvgl.h"
-#include "SCSCL.h"
+#include "feetech_scs.h"
 #include "i2c_bus.h"
 #include "bmi270_api.h"
 #include "bmi2.h"
@@ -58,61 +58,138 @@ static void Bmi270DelayUs(uint32_t period_us, void *intf_ptr) {
 #define TAG "M5StackCoreS3Board"
 // SI12T 灵敏度参考 BSP level 4 (0xCC), 范围 0(0x88)~7(0xFF)
 
-class FaceTracker;
-
+// 舵机脖子：两颗 Feetech SCS0009 挂在同一条半双工串口总线上，插值在 ESP32 侧完成。
+//
+// 非阻塞设计（对齐 78/xiaozhi-esp32 的 ServoNeck）：MoveTo 只登记目标就返回，Tick 每 20ms
+// 推进一步。头部动作、表情抖动和 MCP 语音指令因此不会互相阻塞，也不会同时抢半双工总线。
 class StackChanServo {
 public:
+    struct Axis {
+        int target_deg = 0;
+        int start_deg = 0;
+        int current_deg = 0;
+        uint32_t move_start_ms = 0;
+        uint32_t move_duration_ms = 0;
+        bool moving = false;
+        // 单调请求号。Tick 先快照、放开 motion_mutex_ 去用总线，再回来核对这个号：
+        // move_start_ms 只有毫秒精度，分不开两次快速请求，计数器可以。
+        uint64_t request_token = 0;
+    };
+
+    static constexpr uint32_t MOTION_TICK_MS = 20;
+    // 每次 WritePos 都带一点自己的行程时间，掉一拍也是滑过去而不是跳过去。
+    static constexpr int MOTION_PER_WRITE_TIME_MS = 30;
+    static constexpr int BOOT_READPOS_MAX_ATTEMPTS = 8;
+    static constexpr int BOOT_READPOS_RETRY_MS = 40;
+
     bool Begin() {
-        if (!bus_.begin(UART_NUM_1, 1000000, 6, 7)) {
-            ESP_LOGE("Servo", "SCS bus begin failed");
+        bus_mutex_ = xSemaphoreCreateMutex();
+        motion_mutex_ = xSemaphoreCreateMutex();
+        if (bus_mutex_ == nullptr || motion_mutex_ == nullptr) {
+            ESP_LOGE("Servo", "could not create mutexes");
             return false;
         }
-        ESP_LOGI("Servo", "SCS bus init OK on UART1 GPIO6/7 @1Mbps");
-
-        // Load calibrated zero from NVS, fall back to default (yaw=0, pitch=30)
+        bus_.begin(SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
+        ready_ = true;
+        ESP_LOGI("Servo", "SCS bus init OK on UART%d GPIO%d/%d @%d bps",
+                 (int)SERVO_UART_NUM, SERVO_TX_PIN, SERVO_RX_PIN, SERVO_BAUDRATE);
+        ScanBus();
         LoadZeroCalibration();
-        MoveTo(yaw_zero_, pitch_zero_, 1500);
 
-        esp_timer_create_args_t args = {};
-        args.callback = &StackChanServo::IdleScanCb;
-        args.arg = this;
-        args.dispatch_method = ESP_TIMER_TASK;
-        args.name = "servo_idle";
-        args.skip_unhandled_events = true;
-        esp_timer_create(&args, &idle_timer_);
-        esp_timer_start_periodic(idle_timer_, 4000000);
-        scan_running_ = true;
+        // 先把上电时所在的位置钉住再回中位：舵机不记得上一条目标点，直接写中位会让头
+        // 突然甩过去，pitch 还可能撞限位。pitch 先做，它才是那个有端限的轴。
+        HoldCurrent(SERVO_PITCH_ID, pitch_, true);
+        HoldCurrent(SERVO_YAW_ID, yaw_, false);
+        // 显式上力矩：部分 SCS 舵机上电默认无力矩，会导致“语音控制舵机没反应”
+        SetTorque(true);
+
+        xTaskCreate([](void* self) {
+            auto* servo = static_cast<StackChanServo*>(self);
+            while (true) {
+                servo->Tick();
+                vTaskDelay(pdMS_TO_TICKS(MOTION_TICK_MS));
+            }
+        }, "servo_neck", 3072, this, 4, nullptr);
+
+        StartMove(yaw_zero_, pitch_zero_, 1500);
         return true;
     }
 
+    // 开机自检，只跑一次：确认哪些 ID 在 1Mbps 上应答。全扫不到就是供电或接线问题
+    void ScanBus() {
+        int found[10] = {};
+        int n = 0;
+        for (int id = 1; id <= 10; id++) {
+            if (Ping((uint8_t)id) >= 0) found[n++] = id;
+        }
+        if (n == 0) {
+            ESP_LOGE("Servo", "Scan: NO servo responded at %d bps - check body battery/USB-C and servo cable",
+                     SERVO_BAUDRATE);
+            return;
+        }
+        char ids[48] = {};
+        int off = 0;
+        for (int i = 0; i < n; i++) {
+            off += snprintf(ids + off, sizeof(ids) - off, i ? ",%d" : "%d", found[i]);
+        }
+        ESP_LOGI("Servo", "Scan: %d servo(s) responded at %d bps, IDs=%s", n, SERVO_BAUDRATE, ids);
+    }
+
     void MoveTo(int yaw_deg, int pitch_deg, int time_ms) {
+        // 保持原厂机械安全范围，不要放宽：放宽到 ±128 / 0~90 会撞坏舵机
         if (yaw_deg < -45) yaw_deg = -45;
         if (yaw_deg > 45) yaw_deg = 45;
-        if (pitch_deg < 5) pitch_deg = 5;
-        if (pitch_deg > 60) pitch_deg = 60;
-        int yaw_pos = 460 + yaw_deg * 16 / 5;
-        int pitch_pos = 620 + pitch_deg * 16 / 5;
-        bus_.WritePos(1, yaw_pos, time_ms, 0);
-        bus_.WritePos(2, pitch_pos, time_ms, 0);
+        StartMove(yaw_deg, pitch_deg, time_ms > 0 ? (uint32_t)time_ms : MOTION_TICK_MS);
     }
 
-    void PauseScan() {
-        if (scan_running_ && idle_timer_) {
-            esp_timer_stop(idle_timer_);
-            scan_running_ = false;
-        }
-    }
-
-    void ResumeScan() {
-        if (!scan_running_ && idle_timer_) {
-            esp_timer_start_periodic(idle_timer_, 4000000);
-            scan_running_ = true;
-        }
+    // speed 100~1000（官方语义，150 为自然速度），映射到舵机行程时间
+    // 150 -> 500ms，1000 -> 150ms，100 -> 750ms
+    void MoveWithSpeed(int yaw_deg, int pitch_deg, int speed) {
+        // 防御：休眠会关水平轴力矩，任何一次运动指令都顺手恢复，避免"说了不动"
+        if (!torque_on_) SetTorque(true);
+        if (speed < 100) speed = 100;
+        if (speed > 1000) speed = 1000;
+        int time_ms = (int)(500.0f * 150.0f / (float)speed);
+        if (time_ms < 150) time_ms = 150;
+        if (time_ms > 1500) time_ms = 1500;
+        MoveTo(yaw_deg, pitch_deg, time_ms);
     }
 
     void Center() { MoveTo(yaw_zero_, pitch_zero_, 600); }
 
-    void SetFaceTracker(FaceTracker* ft) { tracker_ = ft; }
+    int GetYaw() {
+        xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+        int v = yaw_.current_deg;
+        xSemaphoreGive(motion_mutex_);
+        return v;
+    }
+    int GetPitch() {
+        xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+        int v = pitch_.current_deg;
+        xSemaphoreGive(motion_mutex_);
+        return v;
+    }
+
+    // 回读舵机实际位置；任一轴无响应返回 false（多半是 VM_EN 未上电或总线故障）。
+    // 半双工总线，读必须和 Tick 的写共用一把锁，否则交错出来的是坏帧而不是错误。
+    bool ReadRaw(int& yaw_raw, int& pitch_raw) {
+        xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+        yaw_raw = bus_.ReadPos(SERVO_YAW_ID);
+        pitch_raw = bus_.ReadPos(SERVO_PITCH_ID);
+        xSemaphoreGive(bus_mutex_);
+        return yaw_raw >= 0 && pitch_raw >= 0;
+    }
+    static int YawFromRaw(int raw) { return (raw - 460) * 5 / 16; }
+    static int PitchFromRaw(int raw) { return (raw - 620) * 5 / 16; }
+
+    // 休眠时松开水平轴力矩省电（pitch 保持，头不会垂）
+    void SetYawTorque(bool on) {
+        if (!on) InvalidateRequests();  // 在途的移动会和松力矩打架
+        xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+        bool ok = bus_.EnableTorque(SERVO_YAW_ID, on ? 1 : 0) == 0;
+        xSemaphoreGive(bus_mutex_);
+        if (ok) torque_on_ = on;
+    }
 
     void Nod();
     void Shake();
@@ -121,11 +198,174 @@ public:
     bool IsAnimating() const { return anim_running_; }
 
 private:
-    static void IdleScanCb(void* arg) {
-        auto* self = static_cast<StackChanServo*>(arg);
-        int yaw = (rand() % 81) - 40;     // -40° ~ +40°
-        int pitch = 10 + (rand() % 31);   // 10° ~ 40°
-        self->MoveTo(yaw, pitch, 1500);
+    static uint32_t NowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+
+    static float EaseOutCubic(float t) {
+        float inv = 1.0f - t;
+        return 1.0f - inv * inv * inv;
+    }
+
+    static int YawDegToPos(int deg) {
+        int pos = 460 + deg * 16 / 5;
+        if (pos < 0) pos = 0;
+        if (pos > 1000) pos = 1000;
+        return pos;
+    }
+
+    static int PitchDegToPos(int deg) {
+        if (deg < SAFE_PITCH_MIN) deg = SAFE_PITCH_MIN;
+        if (deg > SAFE_PITCH_MAX) deg = SAFE_PITCH_MAX;
+        int pos = 620 + deg * 16 / 5;
+        if (pos < 0) pos = 0;
+        if (pos > 1000) pos = 1000;
+        return pos;
+    }
+
+    // 登记一次移动，立即返回；Tick() 负责推进。
+    void StartMove(int yaw_deg, int pitch_deg, uint32_t duration_ms) {
+        if (!ready_) return;
+        if (pitch_deg < SAFE_PITCH_MIN) pitch_deg = SAFE_PITCH_MIN;
+        if (pitch_deg > SAFE_PITCH_MAX) pitch_deg = SAFE_PITCH_MAX;
+        if (duration_ms == 0) duration_ms = MOTION_TICK_MS;
+        uint32_t now_ms = NowMs();
+        xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+        uint64_t token = ++next_token_;
+        Stage(yaw_, yaw_deg, now_ms, duration_ms, token);
+        Stage(pitch_, pitch_deg, now_ms, duration_ms, token);
+        xSemaphoreGive(motion_mutex_);
+    }
+
+    void InvalidateRequests() {
+        if (motion_mutex_ == nullptr) return;
+        xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+        ++next_token_;
+        yaw_.moving = false;
+        pitch_.moving = false;
+        xSemaphoreGive(motion_mutex_);
+    }
+
+    // 两轴各走一步插值。每 MOTION_TICK_MS 调一次。
+    void Tick() {
+        if (!ready_) return;
+        uint32_t now_ms = NowMs();
+
+        Axis yaw_local, pitch_local;
+        uint64_t token;
+        xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+        if (!yaw_.moving && !pitch_.moving) {
+            xSemaphoreGive(motion_mutex_);
+            return;
+        }
+        yaw_local = yaw_;
+        pitch_local = pitch_;
+        token = next_token_;
+        int yaw_next = yaw_.current_deg;
+        bool yaw_moving = yaw_.moving;
+        Advance(yaw_local, now_ms, yaw_next, yaw_moving);
+        int pitch_next = pitch_.current_deg;
+        bool pitch_moving = pitch_.moving;
+        Advance(pitch_local, now_ms, pitch_next, pitch_moving);
+        xSemaphoreGive(motion_mutex_);
+
+        // 总线比锁慢，所以不持有 motion_mutex_ 去用总线。这个窗口里来的新请求会让下面
+        // 的写变成过期值，写完之后用 token 核对就是干这个的。
+        xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+        if (yaw_local.moving) {
+            bus_.WritePos(SERVO_YAW_ID, YawDegToPos(yaw_next), MOTION_PER_WRITE_TIME_MS, 0);
+        }
+        if (pitch_local.moving) {
+            bus_.WritePos(SERVO_PITCH_ID, PitchDegToPos(pitch_next), MOTION_PER_WRITE_TIME_MS, 0);
+        }
+        xSemaphoreGive(bus_mutex_);
+
+        xSemaphoreTake(motion_mutex_, portMAX_DELAY);
+        // 只有还是同一个请求，才把算出来的结果提交回去。
+        if (next_token_ == token) {
+            yaw_.current_deg = yaw_next;
+            yaw_.moving = yaw_moving;
+            pitch_.current_deg = pitch_next;
+            pitch_.moving = pitch_moving;
+        }
+        xSemaphoreGive(motion_mutex_);
+    }
+
+    // 问舵机实际在哪，而不是我们最后一次告诉它去哪。这是区分“头在零位”和
+    // “头根本没插上”的唯一办法——其他位置汇报都是把指令值原样回显。
+    int Ping(uint8_t id) {
+        if (!ready_) return -1;
+        xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+        int pos = bus_.ReadPos(id);
+        xSemaphoreGive(bus_mutex_);
+        return pos;
+    }
+
+    bool SetTorque(bool on) {
+        if (!ready_) return false;
+        if (!on) InvalidateRequests();
+        xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+        bool ok = bus_.EnableTorque(SERVO_YAW_ID, on ? 1 : 0) == 0 &&
+                  bus_.EnableTorque(SERVO_PITCH_ID, on ? 1 : 0) == 0;
+        xSemaphoreGive(bus_mutex_);
+        if (ok) torque_on_ = on;
+        return ok;
+    }
+
+    static void Stage(Axis& axis, int target_deg, uint32_t now_ms,
+                      uint32_t duration_ms, uint64_t token) {
+        axis.start_deg = axis.current_deg;
+        axis.target_deg = target_deg;
+        axis.move_start_ms = now_ms;
+        axis.move_duration_ms = duration_ms;
+        axis.moving = (target_deg != axis.current_deg);
+        axis.request_token = token;
+    }
+
+    // 按墙上时间线性推进，再套缓出曲线。用挂钟而不是累加 tick，总线延迟或锁争用
+    // 就不会把一次移动无限拉长。
+    static void Advance(const Axis& axis, uint32_t now_ms,
+                        int& next_deg, bool& still_moving) {
+        if (!axis.moving) return;
+        uint32_t elapsed = now_ms - axis.move_start_ms;
+        if (axis.move_duration_ms == 0 || elapsed >= axis.move_duration_ms) {
+            next_deg = axis.target_deg;
+            still_moving = false;
+            return;
+        }
+        float t = static_cast<float>(elapsed) / static_cast<float>(axis.move_duration_ms);
+        float eased = EaseOutCubic(t);
+        int delta = axis.target_deg - axis.start_deg;
+        next_deg = axis.start_deg + static_cast<int>(lroundf(delta * eased));
+    }
+
+    // 读一次当前位置，并立刻命令它停在那里。
+    void HoldCurrent(uint8_t id, Axis& axis, bool is_pitch) {
+        int pos = -1;
+        for (int i = 0; i < BOOT_READPOS_MAX_ATTEMPTS; i++) {
+            xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+            pos = bus_.ReadPos(id);
+            xSemaphoreGive(bus_mutex_);
+            if (pos >= 0) break;
+            // 上电后芯片大约要 200ms 才应答
+            vTaskDelay(pdMS_TO_TICKS(BOOT_READPOS_RETRY_MS));
+        }
+        if (pos < 0) {
+            ESP_LOGW("Servo", "servo %u did not report its position; not holding it", id);
+            return;
+        }
+        int centre = is_pitch ? 620 : 460;
+        int deg = (pos - centre) * 5 / 16;
+        if (is_pitch) {
+            if (deg < SAFE_PITCH_MIN) deg = SAFE_PITCH_MIN;
+            if (deg > SAFE_PITCH_MAX) deg = SAFE_PITCH_MAX;
+        }
+        xSemaphoreTake(bus_mutex_, portMAX_DELAY);
+        // time=0：就在这里、现在，定住。
+        bus_.WritePos(id, is_pitch ? PitchDegToPos(deg) : YawDegToPos(deg), 0, 0);
+        xSemaphoreGive(bus_mutex_);
+        axis.current_deg = deg;
+        axis.target_deg = deg;
+        axis.moving = false;
+        ESP_LOGI("Servo", "servo %u held at raw %d (%d deg)", id, pos, deg);
     }
 
     void LoadZeroCalibration() {
@@ -136,6 +376,8 @@ private:
             if (nvs_get_i8(nvs, "pitch_zero", &v) == ESP_OK && v >= 10 && v <= 50) pitch_zero_ = v;
             nvs_close(nvs);
         }
+        yaw_.current_deg = yaw_zero_;
+        pitch_.current_deg = pitch_zero_;
         ESP_LOGI("Servo", "Zero calibration: yaw=%d pitch=%d", yaw_zero_, pitch_zero_);
     }
 
@@ -152,161 +394,15 @@ private:
 
     int8_t yaw_zero_ = 0;      // 出厂零点（水平舵机）
     int8_t pitch_zero_ = 30;   // 出厂零点（垂直舵机）
-
-    SCSCL bus_;
-    esp_timer_handle_t idle_timer_ = nullptr;
-    FaceTracker* tracker_ = nullptr;
-    bool scan_running_ = false;
+    Axis yaw_;
+    Axis pitch_;
+    FeetechScs bus_;
+    SemaphoreHandle_t bus_mutex_ = nullptr;
+    SemaphoreHandle_t motion_mutex_ = nullptr;
+    uint64_t next_token_ = 0;
+    bool ready_ = false;
+    bool torque_on_ = false;
     volatile bool anim_running_ = false;
-};
-
-class FaceTracker {
-    static constexpr int DS_W = 40;
-    static constexpr int DS_H = 30;
-public:
-    void Start(EspVideo* camera, StackChanServo* servo) {
-        camera_ = camera;
-        servo_ = servo;
-        if (!camera_ || !servo_) return;
-
-        memset(prev_frame_, 0, sizeof(prev_frame_));
-        paused_ = true;
-        xTaskCreatePinnedToCore(TaskFunc, "face_track", 4096, this, 1, &task_, 1);
-        ESP_LOGI("FaceTrack", "Started (paused until conversation)");
-    }
-
-    void Pause(bool resume_scan = true) {
-        if (disabled_) return;
-        if (!paused_) {
-            paused_ = true;
-            tracking_ = false;
-            if (resume_scan) servo_->ResumeScan();
-            ESP_LOGI("FaceTrack", "Paused (scan=%d)", resume_scan);
-        }
-    }
-
-    void Resume() {
-        if (disabled_) return;
-        if (paused_) {
-            paused_ = false;
-            has_prev_ = false;
-            servo_->PauseScan();
-            ESP_LOGI("FaceTrack", "Resumed");
-        }
-    }
-
-    void SetDisabled(bool disabled) {
-        if (disabled) {
-            Pause(false);       // 先暂停再设标志，否则 Pause 被自己的 disabled_ 挡掉
-            servo_->Center();
-        }
-        disabled_ = disabled;
-        if (!disabled) {
-            Resume();           // 解除禁用后恢复追踪
-        }
-        ESP_LOGI("FaceTrack", "Tracking %s", disabled ? "DISABLED" : "ENABLED");
-    }
-
-    bool IsPaused() const { return paused_; }
-    bool disabled_ = false;
-    float GetYaw() const { return yaw_; }
-    float GetPitch() const { return pitch_; }
-
-private:
-    static void TaskFunc(void* arg) {
-        auto* self = static_cast<FaceTracker*>(arg);
-        while (true) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            if (self->paused_ || !self->camera_->IsOk()) continue;
-            self->Track();
-        }
-    }
-
-    void Track() {
-        uint8_t cur_frame[DS_W * DS_H];
-        int sum_x = 0, sum_y = 0, count = 0;
-
-        bool ok = camera_->PeekFrame([&](const uint8_t* data, size_t len, uint16_t w, uint16_t h) {
-            if (w == 0 || h == 0) return;
-            int sx = w / DS_W;
-            int sy = h / DS_H;
-            for (int dy = 0; dy < DS_H; dy++) {
-                for (int dx = 0; dx < DS_W; dx++) {
-                    int src_offset = (dy * sy * w + dx * sx) * 2;
-                    if ((size_t)src_offset >= len) { cur_frame[dy * DS_W + dx] = 0; continue; }
-                    cur_frame[dy * DS_W + dx] = data[src_offset];
-                }
-            }
-
-            if (!has_prev_) return;
-
-            for (int dy = 3; dy < DS_H - 1; dy++) {
-                for (int dx = 1; dx < DS_W - 1; dx++) {
-                    int idx = dy * DS_W + dx;
-                    uint8_t brightness = cur_frame[idx];
-                    if (brightness > 200) continue;
-                    int diff = abs((int)cur_frame[idx] - (int)prev_frame_[idx]);
-                    if (diff > 20) {
-                        sum_x += dx;
-                        sum_y += dy;
-                        count++;
-                    }
-                }
-            }
-        });
-
-        memcpy(prev_frame_, cur_frame, sizeof(prev_frame_));
-        if (!has_prev_) { has_prev_ = true; return; }
-        if (!ok) return;
-
-        int total_pixels = (DS_W - 2) * (DS_H - 4);
-        if (count < 3 || count > total_pixels / 3) {
-            no_move_count_++;
-            if (no_move_count_ > 6 && tracking_) {
-                tracking_ = false;
-            }
-            return;
-        }
-
-        no_move_count_ = 0;
-        if (!tracking_) {
-            servo_->PauseScan();
-            tracking_ = true;
-        }
-
-        float cx = (float)sum_x / count;
-        float cy = (float)sum_y / count;
-        float target_x = (cx - DS_W / 2.0f) / (DS_W / 2.0f);
-        float target_y = (cy - DS_H / 2.0f) / (DS_H / 2.0f);
-
-        smooth_x_ = smooth_x_ * 0.3f + target_x * 0.7f;
-        smooth_y_ = smooth_y_ * 0.3f + target_y * 0.7f;
-
-        if (fabsf(smooth_x_) < 0.03f) smooth_x_ = 0;
-        if (fabsf(smooth_y_) < 0.03f) smooth_y_ = 0;
-
-        yaw_ -= smooth_x_ * 6.0f;
-        pitch_ -= smooth_y_ * 4.0f;
-        if (yaw_ < -45) yaw_ = -45;
-        if (yaw_ > 45) yaw_ = 45;
-        if (pitch_ < 5) pitch_ = 5;
-        if (pitch_ > 60) pitch_ = 60;
-
-        servo_->MoveTo((int)yaw_, (int)pitch_, 150);
-    }
-
-    EspVideo* camera_ = nullptr;
-    StackChanServo* servo_ = nullptr;
-    TaskHandle_t task_ = nullptr;
-    volatile bool paused_ = false;
-    bool tracking_ = false;
-    bool has_prev_ = false;
-    int no_move_count_ = 0;
-    float yaw_ = 0.0f;
-    float pitch_ = 30.0f;
-    float smooth_x_ = 0.0f;
-    float smooth_y_ = 0.0f;
-    uint8_t prev_frame_[DS_W * DS_H];
 };
 
 struct ServoAnimCtx {
@@ -318,10 +414,7 @@ struct ServoAnimCtx {
 void StackChanServo::Nod() {
     if (anim_running_) return;
     anim_running_ = true;
-    auto* ctx = new ServoAnimCtx{this,
-        tracker_ ? (int)tracker_->GetYaw() : 0,
-        tracker_ ? (int)tracker_->GetPitch() : 30};
-    if (tracker_) tracker_->Pause(false);
+    auto* ctx = new ServoAnimCtx{this, GetYaw(), GetPitch()};
     xTaskCreatePinnedToCore([](void* arg) {
         auto* c = static_cast<ServoAnimCtx*>(arg);
         auto* s = c->servo;
@@ -335,7 +428,6 @@ void StackChanServo::Nod() {
         s->MoveTo(y, p, 300);
         vTaskDelay(pdMS_TO_TICKS(300));
         s->anim_running_ = false;
-        if (s->tracker_) s->tracker_->Resume();
         delete c;
         vTaskDelete(nullptr);
     }, "nod", 2048, ctx, 2, nullptr, 1);
@@ -344,10 +436,7 @@ void StackChanServo::Nod() {
 void StackChanServo::Shake() {
     if (anim_running_) return;
     anim_running_ = true;
-    auto* ctx = new ServoAnimCtx{this,
-        tracker_ ? (int)tracker_->GetYaw() : 0,
-        tracker_ ? (int)tracker_->GetPitch() : 30};
-    if (tracker_) tracker_->Pause(false);
+    auto* ctx = new ServoAnimCtx{this, GetYaw(), GetPitch()};
     xTaskCreatePinnedToCore([](void* arg) {
         auto* c = static_cast<ServoAnimCtx*>(arg);
         auto* s = c->servo;
@@ -361,7 +450,6 @@ void StackChanServo::Shake() {
         s->MoveTo(y, p, 300);
         vTaskDelay(pdMS_TO_TICKS(300));
         s->anim_running_ = false;
-        if (s->tracker_) s->tracker_->Resume();
         delete c;
         vTaskDelete(nullptr);
     }, "shake", 2048, ctx, 2, nullptr, 1);
@@ -370,10 +458,7 @@ void StackChanServo::Shake() {
 void StackChanServo::Tilt() {
     if (anim_running_) return;
     anim_running_ = true;
-    auto* ctx = new ServoAnimCtx{this,
-        tracker_ ? (int)tracker_->GetYaw() : 0,
-        tracker_ ? (int)tracker_->GetPitch() : 30};
-    if (tracker_) tracker_->Pause(false);
+    auto* ctx = new ServoAnimCtx{this, GetYaw(), GetPitch()};
     xTaskCreatePinnedToCore([](void* arg) {
         auto* c = static_cast<ServoAnimCtx*>(arg);
         auto* s = c->servo;
@@ -383,7 +468,6 @@ void StackChanServo::Tilt() {
         s->MoveTo(y, p, 500);
         vTaskDelay(pdMS_TO_TICKS(500));
         s->anim_running_ = false;
-        if (s->tracker_) s->tracker_->Resume();
         delete c;
         vTaskDelete(nullptr);
     }, "tilt", 2048, ctx, 2, nullptr, 1);
@@ -411,14 +495,35 @@ static bool EnableServoPowerViaPy32(i2c_master_bus_handle_t i2c_bus) {
         err = i2c_master_transmit_receive(dev, &reg, 1, &ver, 1, 200);
         if (err == ESP_OK && ver != 0 && ver != 0xFF) {
             ESP_LOGI(TAG, "PY32 found! version=%d, enabling VM_EN", ver);
-            uint8_t buf[2];
-            reg = 0x03; i2c_master_transmit_receive(dev, &reg, 1, &buf[1], 1, 200);
-            buf[0] = 0x03; buf[1] |= 0x01; i2c_master_transmit(dev, buf, 2, 200);
-            reg = 0x09; i2c_master_transmit_receive(dev, &reg, 1, &buf[1], 1, 200);
-            buf[0] = 0x09; buf[1] |= 0x01; i2c_master_transmit(dev, buf, 2, 200);
-            reg = 0x05; i2c_master_transmit_receive(dev, &reg, 1, &buf[1], 1, 200);
-            buf[0] = 0x05; buf[1] |= 0x01; i2c_master_transmit(dev, buf, 2, 200);
-            ESP_LOGI(TAG, "Servo power enabled (VM_EN)");
+            // 0x03=GPIO_M_L(方向) 0x09=GPIO_PU_L(上拉) 0x05=GPIO_O_L(输出)
+            auto set_vm_en_bit = [&](uint8_t reg_addr) {
+                uint8_t reg_val = 0;
+                if (i2c_master_transmit_receive(dev, &reg_addr, 1, &reg_val, 1, 200) != ESP_OK) {
+                    ESP_LOGE(TAG, "PY32: read reg 0x%02X failed", reg_addr);
+                    return false;
+                }
+                uint8_t buf[2] = {reg_addr, (uint8_t)(reg_val | 0x01)};
+                if (i2c_master_transmit(dev, buf, 2, 200) != ESP_OK) {
+                    ESP_LOGE(TAG, "PY32: write reg 0x%02X failed", reg_addr);
+                    return false;
+                }
+                return true;
+            };
+            if (!set_vm_en_bit(0x03) || !set_vm_en_bit(0x09) || !set_vm_en_bit(0x05)) {
+                ESP_LOGE(TAG, "PY32: VM_EN setup failed, servos will not move");
+                return true;  // 仍注册工具，便于在对话里观察失败
+            }
+            // 供电起来后 SCS0009 要 ~200ms 才应答。在这里等，别让舵机脖子的开机读位
+            // 去承担这段唤醒时间。
+            vTaskDelay(pdMS_TO_TICKS(SERVO_POWER_WAKE_MS));
+            uint8_t out_reg = 0x05, out_val = 0;
+            if (i2c_master_transmit_receive(dev, &out_reg, 1, &out_val, 1, 200) != ESP_OK) {
+                ESP_LOGW(TAG, "Servo power enabled, but VM_EN readback failed");
+            } else if ((out_val & 0x01) == 0) {
+                ESP_LOGE(TAG, "VM_EN write ACKed but pin0 reads low (REG_GPIO_O_L=0x%02X), servos stay unpowered", out_val);
+            } else {
+                ESP_LOGI(TAG, "Servo power enabled (VM_EN high, REG_GPIO_O_L=0x%02X)", out_val);
+            }
             return true;
         }
         ESP_LOGD(TAG, "PY32 attempt %d: err=%s ver=0x%02X", i, esp_err_to_name(err), ver);
@@ -427,6 +532,28 @@ static bool EnableServoPowerViaPy32(i2c_master_bus_handle_t i2c_bus) {
     ESP_LOGW(TAG, "PY32 not found after 10 attempts");
     i2c_master_bus_rm_device(dev);
     return false;
+}
+
+// 机身 INA226(0x41) 测的是舵机电池电压，可直接判断 VM 轨是否有电
+static void LogBodyBattery(i2c_master_bus_handle_t i2c_bus) {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x41,
+        .scl_speed_hz = 100000,
+    };
+    i2c_master_dev_handle_t dev = nullptr;
+    if (i2c_master_bus_add_device(i2c_bus, &dev_cfg, &dev) != ESP_OK) {
+        return;
+    }
+    uint8_t reg = 0x02;  // Bus Voltage, LSB = 1.25mV
+    uint8_t buf[2] = {};
+    if (i2c_master_transmit_receive(dev, &reg, 1, buf, 2, 200) == ESP_OK) {
+        int raw = (buf[0] << 8) | buf[1];
+        ESP_LOGI(TAG, "INA226 body battery: %.2f V (raw=0x%04X)", raw * 0.00125f, raw);
+    } else {
+        ESP_LOGW(TAG, "INA226 (0x41) no response - body battery rail may be off/absent");
+    }
+    i2c_master_bus_rm_device(dev);
 }
 
 namespace shizhou_avatar {
@@ -1086,7 +1213,6 @@ public:
         esp_timer_create(&idle_args, &idle_timer_);
     }
 
-    void SetFaceTracker(FaceTracker* ft) { face_tracker_ = ft; }
     void SetServo(StackChanServo* s) { servo_ = s; }
     void SetLedUpdater(std::function<void(const char*)> fn) { led_updater_ = std::move(fn); }
 
@@ -1112,10 +1238,8 @@ public:
         avatar_.SetOverlay(shizhou_avatar::OverlayFor(emotion));
         if (emotion && strcmp(emotion, "sleepy") == 0) {
             SetActiveLocked(false);
-            if (face_tracker_) face_tracker_->Pause(false);
-            if (servo_) servo_->PauseScan();
         }
-        // 非 sleepy 不再无条件 Resume face_tracker——它现在跟设备状态走，由 SetStatus 控制
+        // 非 sleepy 分支继续走下面的表情 + 舵机动画逻辑
         if (servo_ && emotion && !servo_->IsAnimating()) {
             if (!strcmp(emotion, "happy") || !strcmp(emotion, "loving") ||
                 !strcmp(emotion, "laughing") || !strcmp(emotion, "confident") ||
@@ -1161,12 +1285,6 @@ public:
         SpiLcdDisplay::SetStatus(status);
         if (!status || !avatar_.IsReady()) return;
         DisplayLockGuard lock(this);
-        auto state = Application::GetInstance().GetDeviceState();
-        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
-            if (face_tracker_) face_tracker_->Resume();
-        } else if (state == kDeviceStateIdle) {
-            if (face_tracker_) face_tracker_->Pause();
-        }
         bool is_active = (strstr(status, "聆听")
                        || strstr(status, "说话")
                        || strstr(status, "思考")
@@ -1183,7 +1301,6 @@ public:
 
 private:
     shizhou_avatar::LvglAvatar avatar_;
-    FaceTracker* face_tracker_ = nullptr;
     StackChanServo* servo_ = nullptr;
     std::function<void(const char*)> led_updater_;
     esp_timer_handle_t avatar_init_timer_ = nullptr;
@@ -1205,7 +1322,6 @@ private:
         if (active) {
             if (top_bar_)    lv_obj_remove_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
             if (status_bar_) lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
-            if (face_tracker_) face_tracker_->Resume();
         } else {
             if (top_bar_)    lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
             if (status_bar_) lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
@@ -1222,7 +1338,6 @@ private:
         auto self = static_cast<M5StackAvatarDisplay*>(arg);
         DisplayLockGuard lock(self);
         self->SetActiveLocked(false);
-        // face_tracker 由 SetStatus 跟设备状态联动控制，这里只管 UI 顶栏隐藏
     }
 
     static void InitTimerCallback(void* arg) {
@@ -1377,7 +1492,6 @@ private:
     LcdDisplay* display_;
     EspVideo* camera_;
     StackChanServo servo_;
-    FaceTracker face_tracker_;
     esp_timer_handle_t touchpad_timer_;
     esp_timer_handle_t batt_timer_ = nullptr;
     PowerSaveTimer* power_save_timer_;
@@ -1799,17 +1913,58 @@ private:
             });
     }
 
-    void RegisterFaceTrackMcpTool() {
+    // 官方 StackChan 的舵机 MCP（hal_mcp.cpp::xiaozhi_mcp_init）
+    // 参考 https://github.com/m5stack/StackChan/blob/main/firmware/main/hal/hal_mcp.cpp
+    void RegisterServoMcpTools() {
         auto& mcp = McpServer::GetInstance();
-        mcp.AddTool("self.face_track.toggle",
-            "Toggle face tracking on or off. When off, the servo returns to center and stops following faces. When on, it resumes automatic face tracking.",
+        // 中位取决于 NVS 校准值，不能写死成 {0,0}
+        char neutral_desc[128];
+        snprintf(neutral_desc, sizeof(neutral_desc),
+                 "Returns current yaw/pitch in degrees. Neutral position is {yaw:%d, pitch:%d}.",
+                 servo_.GetYaw(), servo_.GetPitch());
+        mcp.AddTool("self.robot.get_head_angles",
+            std::string(neutral_desc),
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                int yaw = servo_.GetYaw();
+                int pitch = servo_.GetPitch();
+                int yaw_raw = 0, pitch_raw = 0;
+                if (servo_.ReadRaw(yaw_raw, pitch_raw)) {
+                    yaw = StackChanServo::YawFromRaw(yaw_raw);
+                    pitch = StackChanServo::PitchFromRaw(pitch_raw);
+                } else {
+                    ESP_LOGE(TAG, "MCP get_head_angles: servo no response (raw yaw=%d pitch=%d)", yaw_raw, pitch_raw);
+                }
+                char buf[64];
+                snprintf(buf, sizeof(buf), "{\"yaw\": %d, \"pitch\": %d}", yaw, pitch);
+                ESP_LOGI(TAG, "MCP get_head_angles: %s", buf);
+                return std::string(buf);
+            });
+        mcp.AddTool("self.robot.set_head_angles",
+            "Adjust head position. GUIDELINES: "
+            "1. Max ranges: Yaw(-45 to 45, left is negative), Pitch(5 to 60, up is larger). "
+            "2. Stay within +/- 30 degrees for natural interaction. "
+            "Speed(100-1000, 150 is natural). "
+            "Omit a parameter to keep its current angle.",
             PropertyList({
-                Property("enabled", kPropertyTypeBoolean)
+                Property("yaw", kPropertyTypeInteger, -9999, -9999, 45),
+                Property("pitch", kPropertyTypeInteger, -9999, -9999, 60),
+                Property("speed", kPropertyTypeInteger, 150, 100, 1000)
             }),
             [this](const PropertyList& props) -> ReturnValue {
-                bool enabled = props["enabled"].value<bool>();
-                face_tracker_.SetDisabled(!enabled);
-                ESP_LOGI(TAG, "MCP face track: %s", enabled ? "ON" : "OFF");
+                int yaw   = props["yaw"].value<int>();
+                int pitch = props["pitch"].value<int>();
+                int speed = props["speed"].value<int>();
+                int target_yaw   = (yaw   != -9999) ? yaw   : servo_.GetYaw();
+                int target_pitch = (pitch != -9999) ? pitch : servo_.GetPitch();
+                int yaw_raw = 0, pitch_raw = 0;
+                bool alive = servo_.ReadRaw(yaw_raw, pitch_raw);
+                servo_.MoveWithSpeed(target_yaw, target_pitch, speed);
+                ESP_LOGI(TAG, "MCP set_head_angles: yaw=%d pitch=%d speed=%d raw_before=%d/%d",
+                         target_yaw, target_pitch, speed, yaw_raw, pitch_raw);
+                if (!alive) {
+                    ESP_LOGE(TAG, "MCP set_head_angles: servo no response - check VM_EN / servo power");
+                }
                 return true;
             });
     }
@@ -1859,16 +2014,16 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 30, -1);
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
-            // 关外设：屏幕驱动 / 背光 / 舵机扫视 / LED 环
+            // 关外设：屏幕驱动 / 背光 / LED 环
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(0);
-            servo_.PauseScan();
             if (py32_dev_) {
                 uint16_t off[12] = {};
                 Py32SetLedFrame(off, 12);
             }
+            if (servo_ok_) servo_.SetYawTorque(false);
             // 深度睡眠新增：关唤醒词检测 + 置深度睡眠标志
             auto& app = Application::GetInstance();
             if (app.GetAudioService().IsWakeWordRunning()) {
@@ -1876,7 +2031,7 @@ private:
             }
             in_deep_sleep_ = true;
             deep_sleep_enter_us_ = esp_timer_get_time();
-            ESP_LOGI(TAG, "Deep sleep entered (LED/servo/wakeword/screen off)");
+            ESP_LOGI(TAG, "Deep sleep entered (LED/wakeword/screen off)");
         });
         power_save_timer_->OnExitSleepMode([this]() {
             // 先清标志：恢复过程中任何触摸走正常手势分支，不进睡眠守卫
@@ -1884,12 +2039,15 @@ private:
             // 恢复外设（顺序：先显示驱动再亮背光，避免花屏一瞬间）
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
-            servo_.ResumeScan();
             if (py32_dev_) {
                 uint16_t neutral = Rgb888To565(60, 35, 10);
                 uint16_t colors[12];
                 for (int i = 0; i < 12; i++) colors[i] = neutral;
                 Py32SetLedFrame(colors, 12);
+            }
+            if (servo_ok_) {
+                servo_.SetYawTorque(true);
+                servo_.Center();
             }
             // 深度睡眠新增：恢复唤醒词检测（回到 Idle 待机后照常工作）
             Application::GetInstance().GetAudioService().EnableWakeWordDetection(true);
@@ -2093,6 +2251,7 @@ private:
     void WakeUpFromDeepSleep() {
         ESP_LOGI(TAG, "Wake up from deep sleep by screen tap");
         power_save_timer_->WakeUp();
+        // 点屏幕就进入聆听，跟原来一致
         Application::GetInstance().ToggleChatState();
     }
 
@@ -2360,28 +2519,29 @@ public:
         I2cDetect();
 #endif
 
-        py32_found_ = EnableServoPowerViaPy32(i2c_bus_);
-        if (py32_found_) {
-            vTaskDelay(pdMS_TO_TICKS(200));
-            servo_ok_ = servo_.Begin();
-            InitializePy32LedDevice();
-            LedSelfTest();
-            RegisterLedMcpTools();
-            RegisterExpressionMcpTool();
-            RegisterFaceTrackMcpTool();
-        }
+        py32_found_ = false;
+        servo_ok_ = false;
 
         InitializeSpi();
         InitializeIli9342Display();
         InitializeCamera();
+
+        // 舵机供电和初始化放到开机后段：外设都起来之后再抬 VM EN，给舵机电源轨足够
+        // 的时间稳定，再等 SERVO_POWER_WAKE_MS 让它应答，最后才读位/回中。
+        py32_found_ = EnableServoPowerViaPy32(i2c_bus_);
+        if (py32_found_) {
+            LogBodyBattery(i2c_bus_);
+            InitializePy32LedDevice();
+            LedSelfTest();
+            RegisterLedMcpTools();
+            RegisterExpressionMcpTool();
+            servo_ok_ = servo_.Begin();
+            RegisterServoMcpTools();
+        }
+
         auto* avatar_display = static_cast<M5StackAvatarDisplay*>(display_);
         if (servo_ok_) {
             avatar_display->SetServo(&servo_);
-        }
-        if (camera_ && camera_->IsOk() && servo_ok_) {
-            face_tracker_.Start(camera_, &servo_);
-            servo_.SetFaceTracker(&face_tracker_);
-            avatar_display->SetFaceTracker(&face_tracker_);
         }
         avatar_display->SetLedUpdater([this](const char* emotion) {
             UpdateLedsFromEmotion(emotion);
@@ -2477,8 +2637,6 @@ public:
         static CustomBacklight backlight(pmic_);
         return &backlight;
     }
-    virtual void PauseFaceTracking() override { face_tracker_.Pause(false); }
-    virtual void ResumeFaceTracking() override { face_tracker_.Resume(); }
 };
 
 DECLARE_BOARD(M5StackCoreS3Board);

@@ -403,7 +403,15 @@ std::vector<int> Ota::ParseVersion(const std::string& version) {
     std::string segment;
     
     while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+        // 跳过非数字段（如 "1.2.3-beta" 的 "3-beta"），并兜住 std::stoi 的异常
+        if (segment.empty() || segment[0] < '0' || segment[0] > '9') {
+            continue;
+        }
+        try {
+            versionNumbers.push_back(std::stoi(segment));
+        } catch (const std::exception&) {
+            // 数值溢出等异常，忽略该段
+        }
     }
     
     return versionNumbers;
